@@ -162,6 +162,7 @@ export async function runInstance(inst: Instance): Promise<void> {
   const hostConfig: Docker.HostConfig = {
     Binds: [`${inst.volumeName}:/config`],
     NetworkMode: net || undefined,
+    CapAdd: ['SYS_PTRACE'],
     SecurityOpt: ['seccomp=unconfined'],
     ShmSize: SHM_SIZE,
     RestartPolicy: { Name: 'unless-stopped' },
@@ -400,8 +401,12 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
 
 // 在实例容器内执行命令，返回 stdout；若命令失败，把 stderr 透出给调用方。
 async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
+  return execCaptureAs(inst, cmd, 'abc');
+}
+
+async function execCaptureAs(inst: Instance, cmd: string[], user?: string): Promise<string> {
   const c = docker.getContainer(inst.containerName);
-  const exec = await c.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: 'abc' });
+  const exec = await c.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
   const stream = await exec.start({ hijack: true, stdin: false });
   return await new Promise<string>((resolve, reject) => {
     let out = '';
@@ -466,6 +471,89 @@ export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
   } catch {
     return DEFAULT_STATUS;
   }
+}
+
+export class AgentRequestError extends Error {
+  statusCode: number;
+  payload: any;
+
+  constructor(statusCode: number, payload: any) {
+    super(payload?.error || `WOC Agent 请求失败（HTTP ${statusCode}）`);
+    this.statusCode = statusCode;
+    this.payload = payload;
+  }
+}
+
+export interface AgentInitResponse {
+  ok: boolean;
+  keySource: 'file' | 'memory';
+  account: { wxid: string };
+  cursor: string;
+  capabilities: { poll: boolean; sendText: boolean };
+}
+
+export interface AgentMessage {
+  id: string;
+  time: number;
+  from: string;
+  to: string;
+  roomId: string | null;
+  type: 'text';
+  text: string;
+  isSelf: boolean;
+  source?: string;
+}
+
+export interface AgentPollResponse {
+  cursor: string;
+  messages: any[];
+}
+
+export interface AgentSendResponse {
+  ok: boolean;
+  clientMsgId: string;
+  accepted: boolean;
+}
+
+async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/poll' | '/agent/send', body: any): Promise<T> {
+  const b64 = Buffer.from(JSON.stringify(body ?? {}), 'utf8').toString('base64');
+  const cmd = [
+    'set -e',
+    'if [ ! -x /woc/woc-agent ]; then echo \'{"error":"该实例镜像不包含 WOC Agent，请先升级实例"}\'; echo 503; exit 0; fi',
+    'mkdir -p /config/.woc-agent',
+    'chmod 700 /config/.woc-agent 2>/dev/null || true',
+    'if ! pgrep -x woc-agent >/dev/null 2>&1; then nohup /woc/woc-agent >/config/.woc-agent/agent.log 2>&1 & fi',
+    'for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8756/agent/health >/dev/null 2>&1 && break; sleep 0.1; done',
+    `printf '%s' '${b64}' | base64 -d | curl -sS -X POST -H 'content-type: application/json' --data-binary @- -w '\\n%{http_code}' 'http://127.0.0.1:8756${path}'`,
+  ].join('; ');
+  const raw = await execCaptureAs(inst, ['bash', '-lc', cmd], 'root');
+  const trimmed = raw.trim();
+  const idx = trimmed.lastIndexOf('\n');
+  if (idx < 0) throw new Error(trimmed || 'WOC Agent 响应格式错误');
+  const text = trimmed.slice(0, idx);
+  const statusCode = Number(trimmed.slice(idx + 1));
+  let payload: any;
+  try {
+    payload = JSON.parse(text || '{}');
+  } catch {
+    throw new Error(text || 'WOC Agent 返回了非 JSON 响应');
+  }
+  if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
+    throw new AgentRequestError(Number.isFinite(statusCode) ? statusCode : 502, payload);
+  }
+  return payload as T;
+}
+
+export async function initMessageAccess(inst: Instance): Promise<AgentInitResponse> {
+  return requestAgent<AgentInitResponse>(inst, '/agent/init', {});
+}
+
+export async function pollMessages(inst: Instance, cursor: string, limit?: number): Promise<AgentPollResponse> {
+  return requestAgent<AgentPollResponse>(inst, '/agent/poll', { cursor, limit });
+}
+
+export async function sendMessage(inst: Instance, to: string, text: string): Promise<AgentSendResponse> {
+  return requestAgent<AgentSendResponse>(inst, '/agent/send', { type: 'text', to, text });
 }
 
 // 拉取微信镜像（首次部署/更新镜像用）。返回拉取日志的最后状态。

@@ -69,6 +69,10 @@ import {
   volDownloadFile,
   volBackupStream,
   volRestoreArchive,
+  initMessageAccess,
+  pollMessages,
+  sendMessage,
+  AgentRequestError,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
@@ -144,6 +148,33 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
   return u;
 }
 
+function requireAccessibleInstance(req: FastifyRequest, reply: FastifyReply, instanceId: unknown): Instance | null {
+  const u = requireAuth(req, reply);
+  if (!u) return null;
+  if (typeof instanceId !== 'string' || !instanceId.trim()) {
+    reply.code(400).send({ error: '必须显式传递 instanceId' });
+    return null;
+  }
+  const id = instanceId.trim();
+  if (!userCanAccess(u, id)) {
+    reply.code(403).send({ error: '无权访问该实例' });
+    return null;
+  }
+  const inst = findInstance(id);
+  if (!inst) {
+    reply.code(404).send({ error: '实例不存在' });
+    return null;
+  }
+  return inst;
+}
+
+function sendAgentError(reply: FastifyReply, e: any) {
+  if (e instanceof AgentRequestError) {
+    return reply.code(e.statusCode).send(e.payload);
+  }
+  return reply.code(500).send({ error: e?.message || 'WOC Agent 调用失败' });
+}
+
 // ---------- 登录 / 会话 ----------
 app.post('/api/auth/login', async (req, reply) => {
   const { username, password } = (req.body as any) ?? {};
@@ -195,6 +226,56 @@ app.post('/api/account/password', async (req, reply) => {
   if (!newPassword || String(newPassword).length < 6) return reply.code(400).send({ error: '新密码至少 6 位' });
   resetPassword(u.id, newPassword);
   return { ok: true };
+});
+
+// ---------- 消息访问 ----------
+// 初始化指定实例的消息访问状态。Message Key 由实例内 WOC Agent 管理，Panel 不持有。
+app.post('/api/init', async (req, reply) => {
+  const { instanceId } = (req.body as any) ?? {};
+  const inst = requireAccessibleInstance(req, reply, instanceId);
+  if (!inst) return;
+  try {
+    const result = await initMessageAccess(inst);
+    return { ...result, instanceId: inst.id };
+  } catch (e: any) {
+    return sendAgentError(reply, e);
+  }
+});
+
+async function handlePoll(req: FastifyRequest, reply: FastifyReply, input: any) {
+  const inst = requireAccessibleInstance(req, reply, input?.instanceId);
+  if (!inst) return;
+  const cursor = typeof input?.cursor === 'string' ? input.cursor : '';
+  const limit = input?.limit === undefined ? undefined : Number(input.limit);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 500)) {
+    return reply.code(400).send({ error: 'limit 必须是 1-500 之间的整数' });
+  }
+  try {
+    const result = await pollMessages(inst, cursor, limit);
+    return { ...result, instanceId: inst.id };
+  } catch (e: any) {
+    return sendAgentError(reply, e);
+  }
+}
+
+app.post('/api/poll', async (req, reply) => handlePoll(req, reply, (req.body as any) ?? {}));
+app.get('/api/poll', async (req, reply) => handlePoll(req, reply, (req.query as any) ?? {}));
+
+// 发送文本消息。v1 的 ok 表示 WOC Agent 已接受并发起发送动作，不表示微信服务端确认送达。
+app.post('/api/send', async (req, reply) => {
+  const body = (req.body as any) ?? {};
+  const inst = requireAccessibleInstance(req, reply, body.instanceId);
+  if (!inst) return;
+  if (body.type !== undefined && body.type !== 'text') return reply.code(400).send({ error: '当前仅支持 text 消息' });
+  if (typeof body.to !== 'string' || !body.to.trim()) return reply.code(400).send({ error: 'to 不能为空' });
+  if (typeof body.text !== 'string' || !body.text) return reply.code(400).send({ error: 'text 不能为空' });
+  if (body.text.length > 5000) return reply.code(400).send({ error: 'text 过长' });
+  try {
+    const result = await sendMessage(inst, body.to.trim(), body.text);
+    return { ...result, instanceId: inst.id };
+  } catch (e: any) {
+    return sendAgentError(reply, e);
+  }
 });
 
 // ---------- 管理员：子账号管理 ----------

@@ -1,3 +1,12 @@
+ARG WOC_RUST_IMAGE=rust:1-bookworm
+FROM ${WOC_RUST_IMAGE} AS woc-agent-builder
+WORKDIR /src
+COPY woc-agent-rs/Cargo.toml ./Cargo.toml
+COPY woc-agent-rs/Cargo.lock ./Cargo.lock
+COPY woc-agent-rs/src ./src
+RUN cargo build --release
+RUN cargo install --git https://github.com/jackwener/wx-cli.git --rev 739b66a4b16f93b0f2d299c1b3c7ce6f9f7e8156 --locked --root /wx-cli
+
 # WechatOnCloud —— 在浏览器里访问服务端微信
 # 基于 linuxserver 的 KasmVNC 基础镜像（多架构 amd64/arm64）：
 # 自带 Xvfb + openbox + KasmVNC + web 客户端(3000/3001)
@@ -12,7 +21,7 @@ RUN set -eux; \
     # 中文字体（否则界面/消息显示方块）+ 语言环境 + 下载/解压工具
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        curl ca-certificates locales dpkg \
+        curl ca-certificates locales dpkg procps \
         fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
         libnss3 libgbm1 libasound2 libxss1 \
         xz-utils \
@@ -75,6 +84,11 @@ RUN chmod 755 /woc/wechat-ctl.sh
 COPY app-defs.sh app-ctl.sh /woc/
 RUN chmod 644 /woc/app-defs.sh && chmod 755 /woc/app-ctl.sh
 
+# 实例内消息访问服务。只监听容器本地地址，由面板经 docker exec 转发调用。
+COPY --from=woc-agent-builder /src/target/release/woc-agent /woc/woc-agent
+COPY --from=woc-agent-builder /wx-cli/bin/wx /woc/wx
+RUN chmod +x /woc/woc-agent /woc/wx
+
 # openbox 会话启动时执行此脚本：等待微信就绪 + 常驻拉起微信 + 最小化自动复原看守
 COPY autostart /defaults/autostart
 RUN chmod 755 /defaults/autostart
@@ -84,14 +98,16 @@ RUN chmod 755 /defaults/autostart
 COPY woc-identity.sh /custom-cont-init.d/00-woc-identity
 RUN chmod 755 /custom-cont-init.d/00-woc-identity
 
-# 启动钩子（01）：每次启动用镜像内最新 autostart 覆盖数据卷旧副本（否则旧实例升级后用不上新逻辑）
-COPY woc-update-autostart /custom-cont-init.d/01-woc-autostart
-RUN chmod 755 /custom-cont-init.d/01-woc-autostart
+# 启动钩子（01）：以 root 身份启动实例内消息访问 agent。后续 Panel 仍会按需兜底拉起。
+COPY woc-agent-init.sh /custom-cont-init.d/01-woc-agent
+RUN chmod +x /custom-cont-init.d/01-woc-agent
 
-# 启动钩子（02）：把容器环境 WOC_APP_TYPE 写入 /config/.woc-app，供 autostart 选择启动哪个应用。
-# 须在 autostart 之前执行；缺 WOC_APP_TYPE 则不写 → autostart 回退微信（向后兼容）。
-COPY woc-app-init.sh /custom-cont-init.d/02-woc-app
-RUN chmod 755 /custom-cont-init.d/02-woc-app
+# 启动钩子（02）：每次启动用镜像内最新 autostart 覆盖数据卷旧副本（否则旧实例升级后用不上新逻辑）
+COPY woc-update-autostart /custom-cont-init.d/02-woc-autostart
+RUN chmod +x /custom-cont-init.d/02-woc-autostart
+
+COPY woc-agent-init.sh /custom-cont-init.d/01-woc-agent
+RUN chmod +x /custom-cont-init.d/01-woc-agent
 
 # 3000 = HTTP web 客户端, 3001 = HTTPS
 EXPOSE 3000 3001
