@@ -79,7 +79,18 @@ struct AgentMessage {
 struct HttpRequest {
     method: String,
     path: String,
+    query: HashMap<String, String>,
     body: Vec<u8>,
+}
+
+enum AgentResponse {
+    Json(Value),
+    Binary {
+        status: u16,
+        content_type: String,
+        filename: String,
+        body: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]
@@ -800,11 +811,11 @@ fn send_file(
     )
 }
 
-fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, AgentError> {
+fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<AgentResponse, AgentError> {
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/agent/health") => Ok(
+        ("GET", "/agent/health") => Ok(AgentResponse::Json(
             json!({ "ok": true, "hasKey": state.key_file.exists(), "cursor": current_cursor(state) }),
-        ),
+        )),
         ("POST", "/agent/init") => {
             let body: Value = read_json_body(&req.body)?;
             let wxid = body.get("wxid").and_then(Value::as_str).map(str::to_string);
@@ -822,19 +833,20 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                     }
                 }
             };
-            Ok(json!({
+            Ok(AgentResponse::Json(json!({
                 "ok": true,
                 "keySource": source,
                 "account": { "wxid": key.wxid },
                 "cursor": current_cursor(state),
                 "capabilities": { "poll": true, "sendText": true, "sendImage": true, "sendFile": true }
-            }))
+            })))
         }
         ("POST", "/agent/poll") => {
             let body: Value = read_json_body(&req.body)?;
             let limit = body.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
             let limit = limit.clamp(1, MAX_POLL_LIMIT);
             poll_messages(state, body.get("cursor").and_then(Value::as_str), limit)
+                .map(AgentResponse::Json)
         }
         ("POST", "/agent/send") => {
             let body: Value = read_json_body(&req.body)?;
@@ -851,7 +863,7 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                         .and_then(Value::as_str)
                         .ok_or_else(|| AgentError::bad_request("text 必须是字符串"))?
                         .to_string();
-                    send_text(state, to, text)
+                    send_text(state, to, text).map(AgentResponse::Json)
                 }
                 "image" => {
                     let media_url = body
@@ -869,7 +881,7 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    send_image(state, to, media_url, mime_type, media_id)
+                    send_image(state, to, media_url, mime_type, media_id).map(AgentResponse::Json)
                 }
                 "file" => {
                     let media_url = body
@@ -886,16 +898,66 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    send_file(state, to, media_url, file_name)
+                    send_file(state, to, media_url, file_name).map(AgentResponse::Json)
                 }
                 _ => Err(AgentError::bad_request("当前仅支持 text/image/file 消息")),
             }
         }
+        ("GET", "/agent/media") => download_media(state, &req.query),
         _ => Err(AgentError {
             status: 404,
             message: "not found".to_string(),
         }),
     }
+}
+
+fn download_media(
+    state: &AppState,
+    query: &HashMap<String, String>,
+) -> std::result::Result<AgentResponse, AgentError> {
+    let roomid = query
+        .get("roomid")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    let msgid = query
+        .get("msgid")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if roomid.is_empty() || msgid.is_empty() {
+        return Err(AgentError::bad_request("roomid 和 msgid 必须传递"));
+    }
+    let key = read_key(state).map_err(|e| AgentError::internal(e.to_string()))?;
+    let db_dir = key
+        .db_dir
+        .as_ref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(wechat_db::detect_db_storage)
+        .ok_or_else(|| AgentError::internal("未找到 WOC 微信 db_storage 目录"))?;
+    let keys = key
+        .keys
+        .clone()
+        .or_else(|| {
+            key.keys_file
+                .as_ref()
+                .and_then(|path| wechat_db::read_keys_file(PathBuf::from(path).as_path()).ok())
+        })
+        .ok_or_else(|| AgentError::internal("未找到 Message Key"))?;
+    let media =
+        wechat_db::read_image_media(db_dir, keys, state.state_dir.join("cache"), roomid, msgid)
+            .map_err(|e| AgentError::internal(e.to_string()))?
+            .ok_or_else(|| AgentError {
+                status: 404,
+                message: "图片文件不存在或尚未下载到本地".to_string(),
+            })?;
+    Ok(AgentResponse::Binary {
+        status: 200,
+        content_type: media.content_type,
+        filename: media.filename,
+        body: media.data,
+    })
 }
 
 fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -906,6 +968,12 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let method = parts.next().unwrap_or_default().to_string();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
+    let query = parse_query(
+        raw_path
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default(),
+    );
     let mut content_len = 0usize;
     loop {
         let mut line = String::new();
@@ -924,7 +992,44 @@ fn parse_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     if content_len > 0 {
         reader.read_exact(&mut body)?;
     }
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        body,
+    })
+}
+
+fn parse_query(raw: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(percent_decode(key), percent_decode(value));
+    }
+    out
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: Value) -> Result<()> {
@@ -948,10 +1053,51 @@ fn write_response(stream: &mut TcpStream, status: u16, body: Value) -> Result<()
     Ok(())
 }
 
+fn write_binary_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    filename: &str,
+    body: &[u8],
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Error",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-disposition: inline; filename=\"{}\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        status,
+        reason,
+        content_type,
+        header_safe_filename(filename),
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    Ok(())
+}
+
+fn header_safe_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+        .collect::<String>()
+}
+
 fn serve_connection(state: AppState, mut stream: TcpStream) -> Result<()> {
     let response = match parse_request(&mut stream) {
         Ok(req) => match handle(&state, req) {
-            Ok(body) => (200, body),
+            Ok(AgentResponse::Json(body)) => return write_response(&mut stream, 200, body),
+            Ok(AgentResponse::Binary {
+                status,
+                content_type,
+                filename,
+                body,
+            }) => {
+                return write_binary_response(&mut stream, status, &content_type, &filename, &body)
+            }
             Err(e) => (e.status, json!({ "error": e.message })),
         },
         Err(e) => (400, json!({ "error": e.to_string() })),

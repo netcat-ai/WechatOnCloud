@@ -409,23 +409,31 @@ async function execCaptureAs(inst: Instance, cmd: string[], user?: string): Prom
 }
 
 async function execCaptureAsInput(inst: Instance, cmd: string[], input?: string | Buffer, user?: string): Promise<string> {
+  const output = await execCaptureBufferAsInput(inst, cmd, input, user);
+  return output.toString('utf8');
+}
+
+async function execCaptureBufferAsInput(inst: Instance, cmd: string[], input?: string | Buffer, user?: string): Promise<Buffer> {
   const c = docker.getContainer(inst.containerName);
   const exec = await c.exec({ Cmd: cmd, AttachStdin: input !== undefined, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
   const stream = await exec.start({ hijack: true, stdin: input !== undefined });
-  const result = new Promise<string>((resolve, reject) => {
-    let out = '';
-    let err = '';
-    const stdout = { write: (b: Buffer) => { out += b.toString('utf8'); } } as any;
-    const stderr = { write: (b: Buffer) => { err += b.toString('utf8'); } } as any;
+  const result = new Promise<Buffer>((resolve, reject) => {
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    const stdout = { write: (b: Buffer) => { out.push(Buffer.from(b)); } } as any;
+    const stderr = { write: (b: Buffer) => { err.push(Buffer.from(b)); } } as any;
     docker.modem.demuxStream(stream, stdout, stderr);
     stream.on('end', async () => {
       try {
         const info = await exec.inspect();
+        const stdoutData = Buffer.concat(out);
+        const stderrData = Buffer.concat(err);
         if (info.ExitCode && info.ExitCode !== 0) {
-          reject(new Error((err || out || `命令执行失败，退出码 ${info.ExitCode}`).trim()));
+          const detail = (stderrData.length > 0 ? stderrData : stdoutData).toString('utf8').trim();
+          reject(new Error(detail || `命令执行失败，退出码 ${info.ExitCode}`));
           return;
         }
-        resolve(out || err);
+        resolve(stdoutData.length > 0 ? stdoutData : stderrData);
       } catch (e) {
         reject(e);
       }
@@ -529,7 +537,10 @@ export interface AgentSendResponse {
   };
 }
 
-async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/poll' | '/agent/send', body: any): Promise<T> {
+export type AgentPath = '/agent/init' | '/agent/poll' | '/agent/send';
+export type AgentMediaPath = '/agent/media';
+
+export async function requestAgent<T>(inst: Instance, path: AgentPath, body: unknown): Promise<T> {
   const input = JSON.stringify(body ?? {});
   const cmd = [
     'set -e',
@@ -558,16 +569,27 @@ async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/pol
   return payload as T;
 }
 
-export async function initMessageAccess(inst: Instance): Promise<AgentInitResponse> {
-  return requestAgent<AgentInitResponse>(inst, '/agent/init', {});
-}
-
-export async function pollMessages(inst: Instance, cursor: string, limit?: number): Promise<AgentPollResponse> {
-  return requestAgent<AgentPollResponse>(inst, '/agent/poll', { cursor, limit });
-}
-
-export async function sendAgentMessage(inst: Instance, body: unknown): Promise<AgentSendResponse> {
-  return requestAgent<AgentSendResponse>(inst, '/agent/send', body);
+export async function requestAgentMedia(inst: Instance, path: AgentMediaPath, query: Record<string, string>): Promise<{ statusCode: number; contentType: string; body: Buffer }> {
+  const qs = new URLSearchParams(query).toString();
+  const cmd = [
+    'set -e',
+    'if [ ! -x /woc/woc-agent ]; then echo 503; exit 0; fi',
+    'mkdir -p /config/.woc-agent',
+    'chmod 700 /config/.woc-agent 2>/dev/null || true',
+    'if ! pgrep -x woc-agent >/dev/null 2>&1; then nohup /woc/woc-agent >/config/.woc-agent/agent.log 2>&1 & fi',
+    'for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8756/agent/health >/dev/null 2>&1 && break; sleep 0.1; done',
+    `curl -sS -w '\\n__WOC_STATUS__:%{http_code}:%{content_type}' 'http://127.0.0.1:8756${path}?${qs}'`,
+  ].join('; ');
+  const raw = await execCaptureBufferAsInput(inst, ['bash', '-lc', cmd], '', 'root');
+  const marker = Buffer.from('\n__WOC_STATUS__:');
+  const idx = raw.lastIndexOf(marker);
+  if (idx < 0) throw new Error('WOC Agent 响应格式错误');
+  const body = raw.subarray(0, idx);
+  const meta = raw.subarray(idx + marker.length).toString('utf8').trim();
+  const [statusRaw, ...contentTypeParts] = meta.split(':');
+  const statusCode = Number(statusRaw);
+  if (!Number.isFinite(statusCode)) throw new Error('WOC Agent 状态码格式错误');
+  return { statusCode, contentType: contentTypeParts.join(':') || 'application/octet-stream', body };
 }
 
 // 拉取微信镜像（首次部署/更新镜像用）。返回拉取日志的最后状态。

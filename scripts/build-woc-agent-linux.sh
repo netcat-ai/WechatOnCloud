@@ -4,44 +4,29 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENT_DIR="${ROOT}/docker/woc-agent-rs"
-OUT="${WOC_AGENT_OUT:-${AGENT_DIR}/target-linux/release/woc-agent}"
-BUILDER_TAG="${WOC_AGENT_BUILDER_TAG:-woc-agent-builder-local:woc-agent}"
-BUILDER_FROM="${WOC_AGENT_BUILDER_FROM:-}"
+TARGET_DIR="${WOC_AGENT_TARGET_DIR:-${AGENT_DIR}/target-linux}"
+BUILD_OUT="${TARGET_DIR}/release/woc-agent"
+OUT="${WOC_AGENT_OUT:-${BUILD_OUT}}"
+RUST_IMAGE="${WOC_RUST_IMAGE:-rust:1-bookworm}"
+CARGO_REGISTRY_VOL="${WOC_AGENT_CARGO_REGISTRY_VOL:-woc-agent-cargo-registry}"
+CARGO_GIT_VOL="${WOC_AGENT_CARGO_GIT_VOL:-woc-agent-cargo-git}"
 
-find_builder_image() {
-  if [ -n "${BUILDER_FROM}" ]; then
-    printf '%s\n' "${BUILDER_FROM}"
-    return
-  fi
-  docker images --format '{{.Repository}}:{{.Tag}}' \
-    | awk '/^woc-agent-builder-local:/ || /^woc-agent-builder:/ { print; exit }'
-}
+docker volume create "${CARGO_REGISTRY_VOL}" >/dev/null
+docker volume create "${CARGO_GIT_VOL}" >/dev/null
+mkdir -p "${TARGET_DIR}" "$(dirname "${OUT}")"
 
-builder="$(find_builder_image || true)"
-if [ -z "${builder}" ]; then
-  docker build \
-    -f "${ROOT}/docker/Dockerfile" \
-    --target woc-agent-builder \
-    -t "${BUILDER_TAG}" \
-    "${ROOT}/docker"
-  builder="${BUILDER_TAG}"
+docker run --rm \
+  -v "${AGENT_DIR}:/src" \
+  -v "${CARGO_REGISTRY_VOL}:/usr/local/cargo/registry" \
+  -v "${CARGO_GIT_VOL}:/usr/local/cargo/git" \
+  -w /src \
+  -e CARGO_TARGET_DIR=/src/target-linux \
+  "${RUST_IMAGE}" \
+  cargo build --release
+
+if [ "${OUT}" != "${BUILD_OUT}" ]; then
+  cp "${BUILD_OUT}" "${OUT}"
 fi
 
-tmp="woc-agent-build-$USER-$$"
-cleanup() {
-  docker rm -f "${tmp}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-docker create --name "${tmp}" "${builder}" sleep infinity >/dev/null
-docker start "${tmp}" >/dev/null
-docker exec "${tmp}" rm -rf /src/src
-docker cp "${AGENT_DIR}/Cargo.toml" "${tmp}:/src/Cargo.toml"
-docker cp "${AGENT_DIR}/Cargo.lock" "${tmp}:/src/Cargo.lock"
-docker cp "${AGENT_DIR}/src" "${tmp}:/src/src"
-docker exec "${tmp}" cargo build --release
-
-mkdir -p "$(dirname "${OUT}")"
-docker cp "${tmp}:/src/target/release/woc-agent" "${OUT}"
 file "${OUT}"
 shasum -a 256 "${OUT}"

@@ -69,10 +69,10 @@ import {
   volDownloadFile,
   volBackupStream,
   volRestoreArchive,
-  initMessageAccess,
-  pollMessages,
-  sendAgentMessage,
+  requestAgent,
+  requestAgentMedia,
   AgentRequestError,
+  type AgentPath,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
@@ -85,6 +85,8 @@ const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
 const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, '../../web/dist');
 const COOKIE = 'woc_sess';
+const AGENT_API_USER = process.env.WOC_USERNAME || 'agent';
+const AGENT_API_PASSWORD = process.env.WOC_PASSWORD || '';
 // Public hostnames the panel will accept Host headers for, in addition to the
 // always-on loopback + RFC1918 LAN allowlist. Required for HTTPS reverse-proxy
 // deploys (Caddy/nginx/飞牛 内置反代) where the public hostname differs from
@@ -129,6 +131,35 @@ function currentUser(req: FastifyRequest): User | null {
   return u;
 }
 
+function basicAuthCredentials(req: FastifyRequest): { username: string; password: string } | null {
+  const header = req.headers.authorization;
+  if (!header) return null;
+  const m = /^Basic\s+(.+)$/i.exec(header.trim());
+  if (!m) return null;
+  return credentialsFromBasicToken(m[1]);
+}
+
+function credentialsFromBasicToken(token: string): { username: string; password: string } | null {
+  const decoded = Buffer.from(token, 'base64').toString('utf8');
+  const idx = decoded.indexOf(':');
+  if (idx < 0) return null;
+  return { username: decoded.slice(0, idx), password: decoded.slice(idx + 1) };
+}
+
+function isAgentCredential(cred: { username: string; password: string } | null): boolean {
+  if (!AGENT_API_PASSWORD) return false;
+  return cred?.username === AGENT_API_USER && cred.password === AGENT_API_PASSWORD;
+}
+
+function hasAgentBasicAuth(req: FastifyRequest): boolean {
+  return isAgentCredential(basicAuthCredentials(req));
+}
+
+function hasAgentQueryToken(token: unknown): boolean {
+  if (typeof token !== 'string' || !token.trim()) return false;
+  return isAgentCredential(credentialsFromBasicToken(token.trim()));
+}
+
 function requireAuth(req: FastifyRequest, reply: FastifyReply): User | null {
   const u = currentUser(req);
   if (!u) {
@@ -148,8 +179,7 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
   return u;
 }
 
-function requireAccessibleInstance(req: FastifyRequest, reply: FastifyReply, instanceId: unknown): Instance | null {
-  const u = requireAuth(req, reply);
+function requireAccessibleInstanceForUser(u: User, reply: FastifyReply, instanceId: unknown): Instance | null {
   if (!u) return null;
   if (typeof instanceId !== 'string' || !instanceId.trim()) {
     reply.code(400).send({ error: '必须显式传递 instanceId' });
@@ -166,6 +196,28 @@ function requireAccessibleInstance(req: FastifyRequest, reply: FastifyReply, ins
     return null;
   }
   return inst;
+}
+
+function requireAccessibleInstance(req: FastifyRequest, reply: FastifyReply, instanceId: unknown): Instance | null {
+  const u = requireAuth(req, reply);
+  if (!u) return null;
+  return requireAccessibleInstanceForUser(u, reply, instanceId);
+}
+
+function requireAgentAccessibleInstance(req: FastifyRequest, reply: FastifyReply, instanceId: unknown): Instance | null {
+  if (hasAgentBasicAuth(req) || hasAgentQueryToken((req.query as any)?.token)) {
+    if (typeof instanceId !== 'string' || !instanceId.trim()) {
+      reply.code(400).send({ error: '必须显式传递 instanceId' });
+      return null;
+    }
+    const inst = findInstance(instanceId.trim());
+    if (!inst) {
+      reply.code(404).send({ error: '实例不存在' });
+      return null;
+    }
+    return inst;
+  }
+  return requireAccessibleInstance(req, reply, instanceId);
 }
 
 function sendAgentError(reply: FastifyReply, e: any) {
@@ -228,49 +280,41 @@ app.post('/api/account/password', async (req, reply) => {
   return { ok: true };
 });
 
-// ---------- 消息访问 ----------
-// 初始化指定实例的消息访问状态。Message Key 由实例内 WOC Agent 管理，Panel 不持有。
-app.post('/api/init', async (req, reply) => {
-  const { instanceId } = (req.body as any) ?? {};
-  const inst = requireAccessibleInstance(req, reply, instanceId);
+// ---------- Agent 转发 ----------
+app.post('/api/agent/:action', async (req, reply) => {
+  const { action } = req.params as any;
+  const path = ({ init: '/agent/init', poll: '/agent/poll', send: '/agent/send' } as Record<string, AgentPath>)[String(action || '')];
+  if (!path) return reply.code(404).send({ error: 'not found' });
+  const inst = requireAgentAccessibleInstance(req, reply, (req.query as any)?.instanceid);
   if (!inst) return;
   try {
-    const result = await initMessageAccess(inst);
-    return { ...result, instanceId: inst.id };
+    return await requestAgent(inst, path, (req.body as any) ?? {});
   } catch (e: any) {
     return sendAgentError(reply, e);
   }
 });
 
-async function handlePoll(req: FastifyRequest, reply: FastifyReply, input: any) {
-  const inst = requireAccessibleInstance(req, reply, input?.instanceId);
-  if (!inst) return;
-  const cursor = typeof input?.cursor === 'string' ? input.cursor : '';
-  const limit = input?.limit === undefined ? undefined : Number(input.limit);
-  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 500)) {
-    return reply.code(400).send({ error: 'limit 必须是 1-500 之间的整数' });
-  }
+app.get('/api/agent/media', async (req, reply) => {
+  const query = (req.query as any) ?? {};
+  const inst = hasAgentBasicAuth(req) || hasAgentQueryToken(query.token)
+    ? requireAgentAccessibleInstance(req, reply, query.instanceid)
+    : null;
+  if (!inst) return reply.sent ? undefined : reply.code(401).send({ error: 'unauthorized' });
+  const roomid = String(query.roomid || '').trim();
+  const msgid = String(query.msgid || '').trim();
+  if (!roomid || !msgid) return reply.code(400).send({ error: 'roomid 和 msgid 必须传递' });
   try {
-    const result = await pollMessages(inst, cursor, limit);
-    return { ...result, instanceId: inst.id };
+    const media = await requestAgentMedia(inst, '/agent/media', { roomid, msgid });
+    if (media.statusCode < 200 || media.statusCode >= 300) {
+      reply.code(media.statusCode);
+      reply.header('content-type', media.contentType);
+      return reply.send(media.body);
+    }
+    reply.header('content-type', media.contentType);
+    reply.header('cache-control', 'no-store');
+    return reply.send(media.body);
   } catch (e: any) {
-    return sendAgentError(reply, e);
-  }
-}
-
-app.post('/api/poll', async (req, reply) => handlePoll(req, reply, (req.body as any) ?? {}));
-app.get('/api/poll', async (req, reply) => handlePoll(req, reply, (req.query as any) ?? {}));
-
-// 发送消息。实例由 URL 指定，消息 body 原样转发给 Agent。
-app.post('/api/instances/:id/send', async (req, reply) => {
-  const { id } = req.params as any;
-  const inst = requireAccessibleInstance(req, reply, id);
-  if (!inst) return;
-  try {
-    const result = await sendAgentMessage(inst, (req.body as any) ?? {});
-    return { ...result, instanceId: inst.id };
-  } catch (e: any) {
-    return sendAgentError(reply, e);
+    return reply.code(500).send({ error: e?.message || 'WOC Agent 媒体下载失败' });
   }
 });
 

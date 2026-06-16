@@ -3,8 +3,16 @@ FROM ${WOC_RUST_IMAGE} AS woc-agent-builder
 WORKDIR /src
 COPY woc-agent-rs/Cargo.toml ./Cargo.toml
 COPY woc-agent-rs/Cargo.lock ./Cargo.lock
+RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release
 COPY woc-agent-rs/src ./src
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release && cp /src/target/release/woc-agent /src/woc-agent
 
 # WechatOnCloud —— 在浏览器里访问服务端微信
 # 基于 linuxserver 的 KasmVNC 基础镜像（多架构 amd64/arm64）：
@@ -84,7 +92,7 @@ COPY app-defs.sh app-ctl.sh /woc/
 RUN chmod 644 /woc/app-defs.sh && chmod 755 /woc/app-ctl.sh
 
 # 实例内消息访问服务。只监听容器本地地址，由面板经 docker exec 转发调用。
-COPY --from=woc-agent-builder /src/target/release/woc-agent /woc/woc-agent
+COPY --from=woc-agent-builder /src/woc-agent /woc/woc-agent
 RUN chmod +x /woc/woc-agent
 
 # openbox 会话启动时执行此脚本：等待微信就绪 + 常驻拉起微信 + 最小化自动复原看守

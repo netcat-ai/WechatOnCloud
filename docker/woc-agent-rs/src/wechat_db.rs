@@ -46,6 +46,13 @@ pub struct PollData {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaFile {
+    pub data: Vec<u8>,
+    pub content_type: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Recipient {
     pub username: String,
     pub display: String,
@@ -69,23 +76,9 @@ struct CacheEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReferMsg {
-    msg_type: String,
-    svrid: String,
-    fromusr: String,
     chatusr: String,
     displayname: String,
     content: String,
-    createtime: String,
-}
-
-impl ReferMsg {
-    fn base_type(&self) -> i64 {
-        self.msg_type.trim().parse::<i64>().unwrap_or(0)
-    }
-
-    fn createtime_i64(&self) -> i64 {
-        self.createtime.trim().parse::<i64>().unwrap_or(0)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,6 +204,40 @@ pub fn current_session_state(
 ) -> Result<HashMap<String, i64>> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
     load_session_state(&mut db)
+}
+
+pub fn read_image_media(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+    msgid: &str,
+) -> Result<Option<MediaFile>> {
+    let local_id = match msgid.trim().parse::<i64>() {
+        Ok(value) if value > 0 => value,
+        _ => return Ok(None),
+    };
+    let roomid = roomid.trim();
+    if roomid.is_empty() {
+        return Ok(None);
+    }
+    let mut db = DbCache::new(db_dir.clone(), cache_dir, keys)?;
+    let names = load_names(&mut db)?;
+    let shards = find_msg_shards(&mut db, &names, roomid)?;
+    let account_dir = db_dir
+        .parent()
+        .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?
+        .to_path_buf();
+    for shard in shards {
+        if let Some((content, create_time)) =
+            image_message_content(&shard.path, &shard.table, local_id)?
+        {
+            if let Some(media) = find_image_file(&account_dir, local_id, create_time, &content)? {
+                return Ok(Some(media));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn recipient_display_name(username: &str, nick: &str, remark: &str, alias: &str) -> String {
@@ -812,7 +839,8 @@ fn q_new_messages(
 
     let mut returned_max_ts: HashMap<String, i64> = HashMap::new();
     for msg in &all_msgs {
-        if let (Some(u), Some(ts)) = (msg["username"].as_str(), msg["timestamp"].as_i64()) {
+        if let (Some(u), Some(ts_ms)) = (msg["roomid"].as_str(), msg["msgtime"].as_i64()) {
+            let ts = ts_ms / 1000;
             let current = returned_max_ts.entry(u.to_string()).or_insert(0);
             if ts > *current {
                 *current = ts;
@@ -903,8 +931,8 @@ fn query_new_table(
     db_path: &Path,
     table: &str,
     username: &str,
-    display: &str,
-    chat_type: &str,
+    _display: &str,
+    _chat_type: &str,
     is_group: bool,
     names: &HashMap<String, String>,
     since_ts: i64,
@@ -937,7 +965,7 @@ fn query_new_table(
     let empty_group_names = HashMap::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
-        let sender = sender_label(
+        let _sender_display = sender_label(
             real_sender_id,
             &content,
             is_group,
@@ -946,48 +974,156 @@ fn query_new_table(
             names,
             &empty_group_names,
         );
+        let from = sender_username(real_sender_id, &content, is_group, username, &id2u);
         let text = fmt_content(local_id, local_type, &content, is_group);
         let quote = quote_for_message(local_type, &content, is_group);
-        let message_type = fmt_type(local_type, quote.as_ref());
+        let msgtype = msgtype_for_message(local_type, quote.is_some());
         let mut msg = json!({
-            "chat": display,
-            "username": username,
-            "is_group": is_group,
-            "chat_type": chat_type,
-            "timestamp": ts,
-            "time": ts.to_string(),
-            "sender": sender,
-            "content": text,
-            "type": message_type,
-            "local_id": local_id,
-            "local_type": local_type,
-            "base_type": base_type(local_type),
+            "msgid": local_id.to_string(),
+            "action": "send",
+            "from": from,
+            "tolist": [],
+            "roomid": username,
+            "msgtime": ts.saturating_mul(1000),
+            "msgtype": msgtype,
         });
-        if is_text_message(local_type) {
-            msg["kind"] = Value::String("text".to_string());
-            msg["text"] = msg["content"].clone();
-        }
         if let Some(quote) = quote {
-            msg["kind"] = Value::String("quote".to_string());
-            msg["text"] = msg["content"].clone();
-            msg["quote"] = json!({
-                "type": fmt_base_type(quote.base_type()),
-                "raw_type": quote.msg_type,
-                "svrid": quote.svrid,
-                "fromusr": quote.fromusr,
-                "chatusr": quote.chatusr,
-                "displayname": quote.displayname,
-                "content": quote.content,
-                "createtime": quote.createtime_i64(),
-                "raw_createtime": quote.createtime,
-            });
-        }
-        if let Some(url) = appmsg_url_for_message(local_type, &content) {
-            msg["url"] = Value::String(url);
+            msg["text"] = json!({ "content": format_quote_text(strip_group_prefix(&content, is_group), &quote) });
+        } else if is_text_message(local_type) {
+            msg["text"] = json!({ "content": text });
+        } else if msgtype == "link" {
+            msg["link"] = appmsg_link_body(strip_group_prefix(&content, is_group));
+        } else {
+            msg[msgtype] = json!({ "content": text });
         }
         out.push(msg);
     }
     Ok(out)
+}
+
+fn image_message_content(
+    db_path: &Path,
+    table: &str,
+    local_id: i64,
+) -> Result<Option<(String, i64)>> {
+    let conn = Connection::open(db_path)?;
+    let sql = format!(
+        "SELECT local_type, create_time, message_content, WCDB_CT_message_content
+         FROM [{}] WHERE local_id = ? LIMIT 1",
+        table
+    );
+    let row = conn
+        .query_row(&sql, [local_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                get_content_bytes(row, 2),
+                row.get::<_, i64>(3).unwrap_or(0),
+            ))
+        })
+        .optional()?;
+    let Some((local_type, create_time, content_bytes, ct)) = row else {
+        return Ok(None);
+    };
+    if !matches!(base_type(local_type), 3 | 49) {
+        return Ok(None);
+    }
+    Ok(Some((decompress_message(&content_bytes, ct), create_time)))
+}
+
+fn find_image_file(
+    account_dir: &Path,
+    local_id: i64,
+    create_time: i64,
+    content: &str,
+) -> Result<Option<MediaFile>> {
+    let mut filenames = vec![
+        format!("{local_id}_{create_time}_thumb.jpg"),
+        format!("{local_id}_{create_time}_t.dat"),
+        format!("{local_id}_{create_time}_b.dat"),
+    ];
+    if let Some(md5) = xml_attr(content, "md5").filter(|value| is_hex_like(value, 32)) {
+        filenames.extend([
+            format!("{md5}.dat"),
+            format!("{md5}_t.dat"),
+            format!("{md5}_b.dat"),
+            format!("{md5}_thumb.jpg"),
+        ]);
+    }
+
+    let roots = [
+        account_dir.join("msg").join("attach"),
+        account_dir.join("cache"),
+    ];
+    for root in roots {
+        for filename in &filenames {
+            if let Some(media) = find_decodable_image_by_name(&root, filename)? {
+                return Ok(Some(media));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn find_decodable_image_by_name(root: &Path, filename: &str) -> Result<Option<MediaFile>> {
+    let Some(path) = find_file_by_name(root, filename)? else {
+        return Ok(None);
+    };
+    let data = fs::read(&path)?;
+    let content_type = detect_media_content_type(&data);
+    if content_type == "application/octet-stream" {
+        return Ok(None);
+    }
+    Ok(Some(MediaFile {
+        data,
+        content_type,
+        filename: filename.to_string(),
+    }))
+}
+
+fn find_file_by_name(root: &Path, filename: &str) -> Result<Option<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if entry.file_name().to_string_lossy() == filename {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn detect_media_content_type(data: &[u8]) -> String {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg".to_string();
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".to_string();
+    }
+    if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        return "image/webp".to_string();
+    }
+    "application/octet-stream".to_string()
+}
+
+fn xml_attr(xml: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = xml.find(&needle)? + needle.len();
+    let end = xml[start..].find('"')?;
+    Some(unescape_html(&xml[start..start + end]))
+}
+
+fn is_hex_like(value: &str, len: usize) -> bool {
+    value.len() == len && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 impl Names {
@@ -1061,6 +1197,29 @@ fn sender_label(
     String::new()
 }
 
+fn sender_username(
+    real_sender_id: i64,
+    content: &str,
+    is_group: bool,
+    chat_username: &str,
+    id2u: &HashMap<i64, String>,
+) -> String {
+    let sender_uname = id2u.get(&real_sender_id).cloned().unwrap_or_default();
+    if is_group {
+        if !sender_uname.is_empty() && sender_uname != chat_username {
+            return sender_uname;
+        }
+        if content.contains(":\n") {
+            return content.splitn(2, ":\n").next().unwrap_or("").to_string();
+        }
+        return String::new();
+    }
+    if !sender_uname.is_empty() && sender_uname != chat_username {
+        return sender_uname;
+    }
+    chat_username.to_string()
+}
+
 fn sender_display(
     username: &str,
     names: &HashMap<String, String>,
@@ -1092,27 +1251,27 @@ fn base_type(t: i64) -> i64 {
     (t as u64 & 0xFFFFFFFF) as i64
 }
 
-fn fmt_type(t: i64, quote: Option<&ReferMsg>) -> String {
-    if quote.is_some() {
-        return "引用".into();
+fn msgtype_for_message(t: i64, is_quote: bool) -> &'static str {
+    if is_quote {
+        return "text";
     }
-    fmt_base_type(base_type(t))
+    msgtype_for_base(base_type(t))
 }
 
-fn fmt_base_type(base: i64) -> String {
+fn msgtype_for_base(base: i64) -> &'static str {
     match base {
-        1 => "文本".into(),
-        3 => "图片".into(),
-        34 => "语音".into(),
-        42 => "名片".into(),
-        43 => "视频".into(),
-        47 => "表情".into(),
-        48 => "位置".into(),
-        49 => "链接/文件".into(),
-        50 => "通话".into(),
-        10000 => "系统".into(),
-        10002 => "撤回".into(),
-        _ => format!("type={base}"),
+        1 => "text",
+        3 => "image",
+        34 => "voice",
+        42 => "card",
+        43 => "video",
+        47 => "emotion",
+        48 => "location",
+        49 => "link",
+        50 => "voip",
+        10000 => "system",
+        10002 => "revoke",
+        _ => "unknown",
     }
 }
 
@@ -1171,9 +1330,9 @@ fn parse_sysmsg(xml: &str) -> Option<String> {
 
 fn parse_appmsg(text: &str) -> Option<String> {
     if let Some(quote) = parse_refermsg(text) {
-        return Some(format_quote_content(text, &quote));
+        return Some(format_quote_text(text, &quote));
     }
-    let title = extract_xml_text(text, "title").unwrap_or_default();
+    let title = appmsg_title(text);
     let app_name = extract_xml_text(text, "appname").unwrap_or_default();
     if title.is_empty() && app_name.is_empty() {
         None
@@ -1186,6 +1345,10 @@ fn parse_appmsg(text: &str) -> Option<String> {
     }
 }
 
+fn appmsg_title(text: &str) -> String {
+    clean_xml_text(extract_xml_text(text, "title").unwrap_or_default())
+}
+
 fn quote_for_message(local_type: i64, content: &str, is_group: bool) -> Option<ReferMsg> {
     if base_type(local_type) != 49 {
         return None;
@@ -1196,39 +1359,44 @@ fn quote_for_message(local_type: i64, content: &str, is_group: bool) -> Option<R
 fn parse_refermsg(text: &str) -> Option<ReferMsg> {
     let refer_xml = extract_xml_text(text, "refermsg")?;
     Some(ReferMsg {
-        msg_type: clean_xml_text(extract_xml_text(&refer_xml, "type").unwrap_or_default()),
-        svrid: clean_xml_text(extract_xml_text(&refer_xml, "svrid").unwrap_or_default()),
-        fromusr: clean_xml_text(extract_xml_text(&refer_xml, "fromusr").unwrap_or_default()),
         chatusr: clean_xml_text(extract_xml_text(&refer_xml, "chatusr").unwrap_or_default()),
         displayname: clean_xml_text(
             extract_xml_text(&refer_xml, "displayname").unwrap_or_default(),
         ),
         content: clean_xml_text(extract_xml_text(&refer_xml, "content").unwrap_or_default()),
-        createtime: clean_xml_text(extract_xml_text(&refer_xml, "createtime").unwrap_or_default()),
     })
 }
 
-fn format_quote_content(text: &str, quote: &ReferMsg) -> String {
+fn format_quote_text(text: &str, quote: &ReferMsg) -> String {
     let title = clean_xml_text(extract_xml_text(text, "title").unwrap_or_default());
-    let mut out = if title.is_empty() {
-        "[引用]".to_string()
-    } else {
-        format!("[引用] {title}")
-    };
     let quoted_sender = if quote.displayname.is_empty() {
         quote.chatusr.as_str()
     } else {
         quote.displayname.as_str()
     };
-    if !quoted_sender.is_empty() || !quote.content.is_empty() {
-        out.push_str("\n> ");
-        if !quoted_sender.is_empty() {
-            out.push_str(quoted_sender);
-            out.push_str(": ");
-        }
+    let mut out = "这是一条引用/回复消息：".to_string();
+    if !quoted_sender.is_empty() {
+        out.push('\n');
+        out.push_str(quoted_sender);
+    }
+    if !quote.content.is_empty() {
+        out.push('\n');
         out.push_str(&quote.content);
     }
+    out.push_str("\n------");
+    if !title.is_empty() {
+        out.push('\n');
+        out.push_str(&title);
+    }
     out
+}
+
+fn appmsg_link_body(text: &str) -> Value {
+    json!({
+        "title": appmsg_title(text),
+        "description": clean_xml_text(extract_xml_text(text, "des").unwrap_or_default()),
+        "link_url": appmsg_url_for_content(text).unwrap_or_default(),
+    })
 }
 
 fn clean_xml_text(s: String) -> String {
@@ -1241,32 +1409,32 @@ fn is_text_message(t: i64) -> bool {
 
 fn select_poll_messages(mut messages: Vec<Value>, limit: usize) -> Vec<Value> {
     if messages.len() <= limit {
-        messages.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+        messages.sort_by_key(message_sort_ts);
         return messages;
     }
 
     messages.sort_by(|a, b| {
-        let a_ts = a["timestamp"].as_i64().unwrap_or(0);
-        let b_ts = b["timestamp"].as_i64().unwrap_or(0);
+        let a_ts = message_sort_ts(a);
+        let b_ts = message_sort_ts(b);
         a_ts.cmp(&b_ts).then_with(|| {
-            a["username"]
+            a["roomid"]
                 .as_str()
                 .unwrap_or("")
-                .cmp(b["username"].as_str().unwrap_or(""))
+                .cmp(b["roomid"].as_str().unwrap_or(""))
         })
     });
 
     let mut buckets: HashMap<String, VecDeque<Value>> = HashMap::new();
     for msg in messages {
-        let username = msg["username"].as_str().unwrap_or("").to_string();
-        buckets.entry(username).or_default().push_back(msg);
+        let roomid = msg["roomid"].as_str().unwrap_or("").to_string();
+        buckets.entry(roomid).or_default().push_back(msg);
     }
     let mut keys: Vec<String> = buckets.keys().cloned().collect();
     keys.sort_by_key(|key| {
         buckets
             .get(key)
             .and_then(|bucket| bucket.front())
-            .and_then(|msg| msg["timestamp"].as_i64())
+            .map(message_sort_ts)
             .unwrap_or(0)
     });
 
@@ -1289,8 +1457,15 @@ fn select_poll_messages(mut messages: Vec<Value>, limit: usize) -> Vec<Value> {
         }
         keys = remaining;
     }
-    selected.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+    selected.sort_by_key(message_sort_ts);
     selected
+}
+
+fn message_sort_ts(msg: &Value) -> i64 {
+    msg["msgtime"]
+        .as_i64()
+        .or_else(|| msg["timestamp"].as_i64().map(|ts| ts.saturating_mul(1000)))
+        .unwrap_or(0)
 }
 
 fn next_poll_state(
@@ -1311,10 +1486,7 @@ fn next_poll_state(
     session_ts_map
 }
 
-fn appmsg_url_for_message(local_type: i64, content: &str) -> Option<String> {
-    if base_type(local_type) != 49 || !content.contains("<appmsg") {
-        return None;
-    }
+fn appmsg_url_for_content(content: &str) -> Option<String> {
     let url = extract_xml_text(content, "url")
         .or_else(|| extract_xml_text(content, "url1"))
         .map(|s| unescape_html(strip_xml_cdata(&s)))?;
@@ -1575,15 +1747,15 @@ mod tests {
         let mut messages = Vec::new();
         for i in 0..10 {
             messages.push(json!({
-                "username": "busy@chatroom",
-                "timestamp": 1000 + i,
-                "content": format!("busy {i}"),
+                "roomid": "busy@chatroom",
+                "msgtime": (1000 + i) * 1000,
+                "text": { "content": format!("busy {i}") },
             }));
         }
         messages.push(json!({
-            "username": "target@chatroom",
-            "timestamp": 1005,
-            "content": "target",
+            "roomid": "target@chatroom",
+            "msgtime": 1005 * 1000,
+            "text": { "content": "target" },
         }));
 
         let selected = select_poll_messages(messages, 5);
@@ -1591,7 +1763,7 @@ mod tests {
         assert_eq!(selected.len(), 5);
         assert!(selected
             .iter()
-            .any(|msg| msg["username"].as_str() == Some("target@chatroom")));
+            .any(|msg| msg["roomid"].as_str() == Some("target@chatroom")));
     }
 
     #[test]
@@ -1639,7 +1811,6 @@ mod tests {
 
         let quote = parse_refermsg(xml).expect("quote should parse");
 
-        assert_eq!(quote.msg_type, "1");
         assert_eq!(quote.chatusr, "che006");
         assert_eq!(quote.displayname, "青椒Der(大学青年教师，不是大师)");
         assert_eq!(
@@ -1648,7 +1819,7 @@ mod tests {
         );
         assert_eq!(
             parse_appmsg(xml),
-            Some("[引用] @私云虾虾\n> 青椒Der(大学青年教师，不是大师): 虾虾，这个视频的标题是什么：https://www.youtube.com/watch?v=P3W5L3HGBgg".to_string())
+            Some("这是一条引用/回复消息：\n青椒Der(大学青年教师，不是大师)\n虾虾，这个视频的标题是什么：https://www.youtube.com/watch?v=P3W5L3HGBgg\n------\n@私云虾虾".to_string())
         );
     }
 }
