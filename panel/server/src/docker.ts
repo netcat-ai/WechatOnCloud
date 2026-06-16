@@ -405,10 +405,14 @@ async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
 }
 
 async function execCaptureAs(inst: Instance, cmd: string[], user?: string): Promise<string> {
+  return execCaptureAsInput(inst, cmd, undefined, user);
+}
+
+async function execCaptureAsInput(inst: Instance, cmd: string[], input?: string | Buffer, user?: string): Promise<string> {
   const c = docker.getContainer(inst.containerName);
-  const exec = await c.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
-  const stream = await exec.start({ hijack: true, stdin: false });
-  return await new Promise<string>((resolve, reject) => {
+  const exec = await c.exec({ Cmd: cmd, AttachStdin: input !== undefined, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
+  const stream = await exec.start({ hijack: true, stdin: input !== undefined });
+  const result = new Promise<string>((resolve, reject) => {
     let out = '';
     let err = '';
     const stdout = { write: (b: Buffer) => { out += b.toString('utf8'); } } as any;
@@ -428,6 +432,11 @@ async function execCaptureAs(inst: Instance, cmd: string[], user?: string): Prom
     });
     stream.on('error', reject);
   });
+  if (input !== undefined) {
+    stream.write(input);
+    stream.end();
+  }
+  return await result;
 }
 
 // 触发下载/安装（detached，立即返回，后台下载）。按实例 appType 分发：app-ctl.sh wechat → 委托回
@@ -489,7 +498,7 @@ export interface AgentInitResponse {
   keySource: 'file' | 'memory';
   account: { wxid: string };
   cursor: string;
-  capabilities: { poll: boolean; sendText: boolean };
+  capabilities: { poll: boolean; sendText: boolean; sendImage?: boolean; sendFile?: boolean };
 }
 
 export interface AgentMessage {
@@ -498,7 +507,7 @@ export interface AgentMessage {
   from: string;
   to: string;
   roomId: string | null;
-  type: 'text';
+  type: 'text' | 'image' | 'file';
   text: string;
   isSelf: boolean;
   source?: string;
@@ -521,7 +530,7 @@ export interface AgentSendResponse {
 }
 
 async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/poll' | '/agent/send', body: any): Promise<T> {
-  const b64 = Buffer.from(JSON.stringify(body ?? {}), 'utf8').toString('base64');
+  const input = JSON.stringify(body ?? {});
   const cmd = [
     'set -e',
     'if [ ! -x /woc/woc-agent ]; then echo \'{"error":"该实例镜像不包含 WOC Agent，请先升级实例"}\'; echo 503; exit 0; fi',
@@ -529,9 +538,9 @@ async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/pol
     'chmod 700 /config/.woc-agent 2>/dev/null || true',
     'if ! pgrep -x woc-agent >/dev/null 2>&1; then nohup /woc/woc-agent >/config/.woc-agent/agent.log 2>&1 & fi',
     'for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8756/agent/health >/dev/null 2>&1 && break; sleep 0.1; done',
-    `printf '%s' '${b64}' | base64 -d | curl -sS -X POST -H 'content-type: application/json' --data-binary @- -w '\\n%{http_code}' 'http://127.0.0.1:8756${path}'`,
+    `curl -sS -X POST -H 'content-type: application/json' --data-binary @- -w '\\n%{http_code}' 'http://127.0.0.1:8756${path}'`,
   ].join('; ');
-  const raw = await execCaptureAs(inst, ['bash', '-lc', cmd], 'root');
+  const raw = await execCaptureAsInput(inst, ['bash', '-lc', cmd], input, 'root');
   const trimmed = raw.trim();
   const idx = trimmed.lastIndexOf('\n');
   if (idx < 0) throw new Error(trimmed || 'WOC Agent 响应格式错误');
@@ -557,8 +566,8 @@ export async function pollMessages(inst: Instance, cursor: string, limit?: numbe
   return requestAgent<AgentPollResponse>(inst, '/agent/poll', { cursor, limit });
 }
 
-export async function sendMessage(inst: Instance, to: string, text: string): Promise<AgentSendResponse> {
-  return requestAgent<AgentSendResponse>(inst, '/agent/send', { type: 'text', to, text });
+export async function sendAgentMessage(inst: Instance, body: unknown): Promise<AgentSendResponse> {
+  return requestAgent<AgentSendResponse>(inst, '/agent/send', body);
 }
 
 // 拉取微信镜像（首次部署/更新镜像用）。返回拉取日志的最后状态。

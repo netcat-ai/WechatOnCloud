@@ -67,6 +67,27 @@ struct CacheEntry {
     decrypted_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferMsg {
+    msg_type: String,
+    svrid: String,
+    fromusr: String,
+    chatusr: String,
+    displayname: String,
+    content: String,
+    createtime: String,
+}
+
+impl ReferMsg {
+    fn base_type(&self) -> i64 {
+        self.msg_type.trim().parse::<i64>().unwrap_or(0)
+    }
+
+    fn createtime_i64(&self) -> i64 {
+        self.createtime.trim().parse::<i64>().unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CacheMode {
     CacheHit,
@@ -926,7 +947,8 @@ fn query_new_table(
             &empty_group_names,
         );
         let text = fmt_content(local_id, local_type, &content, is_group);
-        let message_type = fmt_type(local_type);
+        let quote = quote_for_message(local_type, &content, is_group);
+        let message_type = fmt_type(local_type, quote.as_ref());
         let mut msg = json!({
             "chat": display,
             "username": username,
@@ -937,10 +959,28 @@ fn query_new_table(
             "sender": sender,
             "content": text,
             "type": message_type,
+            "local_id": local_id,
+            "local_type": local_type,
+            "base_type": base_type(local_type),
         });
         if is_text_message(local_type) {
             msg["kind"] = Value::String("text".to_string());
             msg["text"] = msg["content"].clone();
+        }
+        if let Some(quote) = quote {
+            msg["kind"] = Value::String("quote".to_string());
+            msg["text"] = msg["content"].clone();
+            msg["quote"] = json!({
+                "type": fmt_base_type(quote.base_type()),
+                "raw_type": quote.msg_type,
+                "svrid": quote.svrid,
+                "fromusr": quote.fromusr,
+                "chatusr": quote.chatusr,
+                "displayname": quote.displayname,
+                "content": quote.content,
+                "createtime": quote.createtime_i64(),
+                "raw_createtime": quote.createtime,
+            });
         }
         if let Some(url) = appmsg_url_for_message(local_type, &content) {
             msg["url"] = Value::String(url);
@@ -1048,8 +1088,18 @@ fn decompress_message(data: &[u8], ct: i64) -> String {
     String::from_utf8_lossy(data).into_owned()
 }
 
-fn fmt_type(t: i64) -> String {
-    let base = (t as u64 & 0xFFFFFFFF) as i64;
+fn base_type(t: i64) -> i64 {
+    (t as u64 & 0xFFFFFFFF) as i64
+}
+
+fn fmt_type(t: i64, quote: Option<&ReferMsg>) -> String {
+    if quote.is_some() {
+        return "引用".into();
+    }
+    fmt_base_type(base_type(t))
+}
+
+fn fmt_base_type(base: i64) -> String {
     match base {
         1 => "文本".into(),
         3 => "图片".into(),
@@ -1067,7 +1117,7 @@ fn fmt_type(t: i64) -> String {
 }
 
 fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) -> String {
-    let base = (local_type as u64 & 0xFFFFFFFF) as i64;
+    let base = base_type(local_type);
     match base {
         3 => return format!("[图片] local_id={local_id}"),
         34 => return "[语音]".into(),
@@ -1120,6 +1170,9 @@ fn parse_sysmsg(xml: &str) -> Option<String> {
 }
 
 fn parse_appmsg(text: &str) -> Option<String> {
+    if let Some(quote) = parse_refermsg(text) {
+        return Some(format_quote_content(text, &quote));
+    }
     let title = extract_xml_text(text, "title").unwrap_or_default();
     let app_name = extract_xml_text(text, "appname").unwrap_or_default();
     if title.is_empty() && app_name.is_empty() {
@@ -1133,8 +1186,57 @@ fn parse_appmsg(text: &str) -> Option<String> {
     }
 }
 
+fn quote_for_message(local_type: i64, content: &str, is_group: bool) -> Option<ReferMsg> {
+    if base_type(local_type) != 49 {
+        return None;
+    }
+    parse_refermsg(strip_group_prefix(content, is_group))
+}
+
+fn parse_refermsg(text: &str) -> Option<ReferMsg> {
+    let refer_xml = extract_xml_text(text, "refermsg")?;
+    Some(ReferMsg {
+        msg_type: clean_xml_text(extract_xml_text(&refer_xml, "type").unwrap_or_default()),
+        svrid: clean_xml_text(extract_xml_text(&refer_xml, "svrid").unwrap_or_default()),
+        fromusr: clean_xml_text(extract_xml_text(&refer_xml, "fromusr").unwrap_or_default()),
+        chatusr: clean_xml_text(extract_xml_text(&refer_xml, "chatusr").unwrap_or_default()),
+        displayname: clean_xml_text(
+            extract_xml_text(&refer_xml, "displayname").unwrap_or_default(),
+        ),
+        content: clean_xml_text(extract_xml_text(&refer_xml, "content").unwrap_or_default()),
+        createtime: clean_xml_text(extract_xml_text(&refer_xml, "createtime").unwrap_or_default()),
+    })
+}
+
+fn format_quote_content(text: &str, quote: &ReferMsg) -> String {
+    let title = clean_xml_text(extract_xml_text(text, "title").unwrap_or_default());
+    let mut out = if title.is_empty() {
+        "[引用]".to_string()
+    } else {
+        format!("[引用] {title}")
+    };
+    let quoted_sender = if quote.displayname.is_empty() {
+        quote.chatusr.as_str()
+    } else {
+        quote.displayname.as_str()
+    };
+    if !quoted_sender.is_empty() || !quote.content.is_empty() {
+        out.push_str("\n> ");
+        if !quoted_sender.is_empty() {
+            out.push_str(quoted_sender);
+            out.push_str(": ");
+        }
+        out.push_str(&quote.content);
+    }
+    out
+}
+
+fn clean_xml_text(s: String) -> String {
+    unescape_html(strip_xml_cdata(s.trim())).trim().to_string()
+}
+
 fn is_text_message(t: i64) -> bool {
-    (t as u64 & 0xFFFFFFFF) as i64 == 1
+    base_type(t) == 1
 }
 
 fn select_poll_messages(mut messages: Vec<Value>, limit: usize) -> Vec<Value> {
@@ -1210,7 +1312,7 @@ fn next_poll_state(
 }
 
 fn appmsg_url_for_message(local_type: i64, content: &str) -> Option<String> {
-    if (local_type as u64 & 0xFFFFFFFF) != 49 || !content.contains("<appmsg") {
+    if base_type(local_type) != 49 || !content.contains("<appmsg") {
         return None;
     }
     let url = extract_xml_text(content, "url")
@@ -1512,5 +1614,41 @@ mod tests {
 
         assert_eq!(state.get("busy@chatroom"), Some(&1500));
         assert_eq!(state.get("target@chatroom"), Some(&1800));
+    }
+
+    #[test]
+    fn appmsg_quote_keeps_referenced_message() {
+        let xml = r#"
+<?xml version="1.0"?>
+<msg>
+  <appmsg appid="" sdkver="0">
+    <title>@私云虾虾</title>
+    <type>57</type>
+    <refermsg>
+      <chatusr>che006</chatusr>
+      <type>1</type>
+      <createtime>1781610131</createtime>
+      <displayname>青椒Der(大学青年教师，不是大师)</displayname>
+      <svrid>7318462845630259071</svrid>
+      <fromusr>24933085811@chatroom</fromusr>
+      <content>虾虾，这个视频的标题是什么：https://www.youtube.com/watch?v=P3W5L3HGBgg</content>
+    </refermsg>
+  </appmsg>
+</msg>
+"#;
+
+        let quote = parse_refermsg(xml).expect("quote should parse");
+
+        assert_eq!(quote.msg_type, "1");
+        assert_eq!(quote.chatusr, "che006");
+        assert_eq!(quote.displayname, "青椒Der(大学青年教师，不是大师)");
+        assert_eq!(
+            quote.content,
+            "虾虾，这个视频的标题是什么：https://www.youtube.com/watch?v=P3W5L3HGBgg"
+        );
+        assert_eq!(
+            parse_appmsg(xml),
+            Some("[引用] @私云虾虾\n> 青椒Der(大学青年教师，不是大师): 虾虾，这个视频的标题是什么：https://www.youtube.com/watch?v=P3W5L3HGBgg".to_string())
+        );
     }
 }

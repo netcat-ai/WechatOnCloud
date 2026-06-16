@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 const MAX_TEXT_LEN: usize = 5000;
 const MAX_POLL_LIMIT: usize = 500;
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -411,6 +413,65 @@ fn shell_quote_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn safe_media_file_stem(raw: &str) -> String {
+    let stem: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect();
+    if stem.is_empty() {
+        "image".to_string()
+    } else {
+        stem
+    }
+}
+
+fn safe_media_file_name(raw: &str, fallback: &str) -> String {
+    let name = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(raw)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(180)
+        .collect::<String>()
+        .trim_matches('.')
+        .to_string();
+    if name.is_empty() {
+        fallback.to_string()
+    } else {
+        name
+    }
+}
+
+fn image_mime_parts(
+    mime_type: &str,
+) -> std::result::Result<(&'static str, &'static str), AgentError> {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Ok(("image/png", "png")),
+        "image/jpeg" | "image/jpg" => Ok(("image/jpeg", "jpg")),
+        "image/webp" => Ok(("image/webp", "webp")),
+        _ => Err(AgentError::bad_request(
+            "mimeType 仅支持 image/png、image/jpeg、image/webp",
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SendTarget {
     id: String,
@@ -555,6 +616,190 @@ fn send_text(state: &AppState, to: String, text: String) -> std::result::Result<
     }))
 }
 
+fn send_downloaded_file(
+    state: &AppState,
+    to: String,
+    media_url: String,
+    file_name: String,
+    kind: &'static str,
+    text: &'static str,
+    max_bytes: u64,
+    timeout_secs: &'static str,
+    error_prefix: &'static str,
+) -> std::result::Result<Value, AgentError> {
+    let to = to.trim().to_string();
+    let media_url = media_url.trim().to_string();
+    if to.trim().is_empty() || to.len() > 200 {
+        return Err(AgentError::bad_request("收件人为空或过长"));
+    }
+    if media_url.is_empty() || media_url.len() > 4096 {
+        return Err(AgentError::bad_request("mediaUrl 为空或过长"));
+    }
+    if !(media_url.starts_with("http://") || media_url.starts_with("https://")) {
+        return Err(AgentError::bad_request("mediaUrl 必须是 http/https URL"));
+    }
+    let client_msg_id = Uuid::new_v4().simple().to_string();
+    let message = AgentMessage {
+        id: client_msg_id.clone(),
+        time: now(),
+        from: "self".to_string(),
+        to: to.clone(),
+        room_id: None,
+        kind: kind.to_string(),
+        text: text.to_string(),
+        is_self: true,
+        source: Some("send".to_string()),
+    };
+
+    if env::var("WOC_AGENT_SEND_MODE").ok().as_deref() == Some("spool") {
+        append_spool_message(state, &message).map_err(|e| AgentError::internal(e.to_string()))?;
+        return Ok(json!({ "ok": true, "clientMsgId": client_msg_id, "accepted": true }));
+    }
+
+    let target = resolve_send_target(state, &to)?;
+    if target.is_group && !target.search_uses_remark {
+        return Err(AgentError::bad_request(
+            "群聊发送必须先设置唯一备注，避免微信搜索误选会话",
+        ));
+    }
+
+    let transfer_dir = PathBuf::from("/config/Desktop");
+    fs::create_dir_all(&transfer_dir).map_err(|e| AgentError::internal(e.to_string()))?;
+    let safe_file_name = safe_media_file_name(&file_name, &client_msg_id);
+    let media_file = transfer_dir.join(format!("woc-send-{safe_file_name}"));
+    let media_path = media_file.to_string_lossy().to_string();
+    let b64_media_path = STANDARD.encode(media_path.as_bytes());
+    let b64_to = STANDARD.encode(target.query.as_bytes());
+    let script = [
+        "set -e".to_string(),
+        "display=\"${DISPLAY:-}\"".to_string(),
+        "if [ -z \"$display\" ]; then for x in /tmp/.X11-unix/X*; do [ -e \"$x\" ] || continue; display=\":${x##*X}\"; break; done; fi".to_string(),
+        "export DISPLAY=\"${display:-:1}\"".to_string(),
+        "command -v curl >/dev/null 2>&1 || { echo \"curl not installed\" >&2; exit 127; }".to_string(),
+        "command -v xclip >/dev/null 2>&1 || { echo \"xclip not installed\" >&2; exit 127; }".to_string(),
+        "command -v xdotool >/dev/null 2>&1 || { echo \"xdotool not installed\" >&2; exit 127; }".to_string(),
+        "command -v timeout >/dev/null 2>&1 || { echo \"timeout not installed\" >&2; exit 127; }".to_string(),
+        "clip_pid=\"\"".to_string(),
+        "cleanup_clip() { if [ -n \"${clip_pid:-}\" ]; then kill \"$clip_pid\" 2>/dev/null || true; wait \"$clip_pid\" 2>/dev/null || true; clip_pid=\"\"; fi; }".to_string(),
+        "set_text_clip() { cleanup_clip; printf '%s' \"$1\" | base64 -d | xclip -selection clipboard -target UTF8_STRING -loops 5 -i >/dev/null 2>&1 & clip_pid=$!; sleep 0.25; }".to_string(),
+        "paste_clip() { xdotool key --clearmodifiers ctrl+v; for i in $(seq 1 30); do if ! kill -0 \"$clip_pid\" 2>/dev/null; then wait \"$clip_pid\" 2>/dev/null || true; clip_pid=\"\"; sleep 0.1; return 0; fi; sleep 0.1; done; echo \"微信未读取剪贴板\" >&2; return 3; }".to_string(),
+        "trap cleanup_clip EXIT".to_string(),
+        format!("img={}", shell_quote_single(&media_path)),
+        format!("img_b64={}", shell_quote_single(&b64_media_path)),
+        "rm -f \"$img\"".to_string(),
+        format!(
+            "curl -fsSL --connect-timeout 10 --max-time 45 --retry 1 --output \"$img\" {}",
+            shell_quote_single(&media_url)
+        ),
+        format!("size=$(wc -c < \"$img\"); [ \"$size\" -gt 0 ] && [ \"$size\" -le {} ] || {{ echo \"文件大小不合法或超过限制\" >&2; exit 4; }}", max_bytes),
+        "chown abc:abc \"$img\" 2>/dev/null || true".to_string(),
+        "if command -v xprop >/dev/null 2>&1; then for browser_win in $({ xdotool search --name '微信' 2>/dev/null || true; xdotool search --name 'WeChat' 2>/dev/null || true; } | sort -u); do class=\"$(xprop -id \"$browser_win\" WM_CLASS 2>/dev/null || true)\"; case \"$class\" in *wechat*) ;; *) xdotool windowclose \"$browser_win\" 2>/dev/null || true; sleep 0.3;; esac; done; fi".to_string(),
+        "win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || { active=\"$(xdotool getactivewindow 2>/dev/null || true)\"; active_name=\"\"; if [ -n \"$active\" ]; then active_name=\"$(xdotool getwindowname \"$active\" 2>/dev/null || true)\"; case \"$active_name\" in *微信*|*WeChat*) win=\"$active\";; esac; fi; }".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --name '微信' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --name 'WeChat' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || { echo \"未找到可见微信窗口\" >&2; exit 2; }".to_string(),
+        "xdotool windowactivate \"$win\"".to_string(),
+        "sleep 0.2".to_string(),
+        "eval \"$(xdotool getwindowgeometry --shell \"$win\")\"".to_string(),
+        "root_x=${X:-0}; root_y=${Y:-0}; root_w=${WIDTH:-1856}; root_h=${HEIGHT:-857}".to_string(),
+        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 157)); file_x=$((root_x + 433)); file_y=$((root_y + root_h - 194)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
+        "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
+        "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
+            + &format!("set_text_clip {}", shell_quote_single(&b64_to))
+            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Return",
+        "sleep 1.5; xdotool key --clearmodifiers Escape; sleep 0.2".to_string(),
+        "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
+        "sleep 0.2".to_string(),
+        "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
+        "sleep 0.2".to_string(),
+        "xdotool mousemove \"$file_x\" \"$file_y\" click 1".to_string(),
+        "sleep 0.8".to_string(),
+        "xdotool key --clearmodifiers ctrl+l".to_string(),
+        "sleep 0.2".to_string(),
+        "printf '%s' \"$img_b64\" | base64 -d | xdotool type --delay 1 --file -".to_string(),
+        "sleep 0.2".to_string(),
+        "xdotool key --clearmodifiers Return".to_string(),
+        "sleep 1.2".to_string(),
+        "xdotool mousemove \"$send_x\" \"$send_y\" click 1".to_string(),
+        "sleep 0.5".to_string(),
+    ].join("; ");
+    let output = Command::new("timeout")
+        .args([timeout_secs, "bash", "-lc", &script])
+        .output()
+        .map_err(|e| AgentError::internal(e.to_string()))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        return Err(AgentError::internal(format!(
+            "{}：{}",
+            error_prefix,
+            if err.trim().is_empty() {
+                out.trim()
+            } else {
+                err.trim()
+            }
+        )));
+    }
+    append_spool_message(state, &message).map_err(|e| AgentError::internal(e.to_string()))?;
+    Ok(json!({
+        "ok": true,
+        "clientMsgId": client_msg_id,
+        "accepted": true,
+        "target": {
+            "id": target.id,
+            "query": target.query,
+            "isGroup": target.is_group
+        }
+    }))
+}
+
+fn send_image(
+    state: &AppState,
+    to: String,
+    media_url: String,
+    mime_type: String,
+    media_id: String,
+) -> std::result::Result<Value, AgentError> {
+    let (_, ext) = image_mime_parts(&mime_type)?;
+    let file_stem = safe_media_file_stem(if media_id.trim().is_empty() {
+        "image"
+    } else {
+        media_id.trim()
+    });
+    send_downloaded_file(
+        state,
+        to,
+        media_url,
+        format!("{file_stem}.{ext}"),
+        "image",
+        "[图片]",
+        MAX_IMAGE_BYTES,
+        "80s",
+        "发送图片失败",
+    )
+}
+
+fn send_file(
+    state: &AppState,
+    to: String,
+    media_url: String,
+    file_name: String,
+) -> std::result::Result<Value, AgentError> {
+    send_downloaded_file(
+        state,
+        to,
+        media_url.clone(),
+        safe_media_file_name(&file_name, &safe_media_file_name(&media_url, "file")),
+        "file",
+        "[文件]",
+        MAX_FILE_BYTES,
+        "140s",
+        "发送文件失败",
+    )
+}
+
 fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, AgentError> {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agent/health") => Ok(
@@ -582,7 +827,7 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                 "keySource": source,
                 "account": { "wxid": key.wxid },
                 "cursor": current_cursor(state),
-                "capabilities": { "poll": true, "sendText": true }
+                "capabilities": { "poll": true, "sendText": true, "sendImage": true, "sendFile": true }
             }))
         }
         ("POST", "/agent/poll") => {
@@ -593,20 +838,58 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
         }
         ("POST", "/agent/send") => {
             let body: Value = read_json_body(&req.body)?;
-            if body.get("type").and_then(Value::as_str) != Some("text") {
-                return Err(AgentError::bad_request("当前仅支持 text 消息"));
-            }
+            let message_type = body.get("type").and_then(Value::as_str).unwrap_or("text");
             let to = body
                 .get("to")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AgentError::bad_request("to 必须是字符串"))?
                 .to_string();
-            let text = body
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::bad_request("text 必须是字符串"))?
-                .to_string();
-            send_text(state, to, text)
+            match message_type {
+                "text" => {
+                    let text = body
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| AgentError::bad_request("text 必须是字符串"))?
+                        .to_string();
+                    send_text(state, to, text)
+                }
+                "image" => {
+                    let media_url = body
+                        .get("mediaUrl")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| AgentError::bad_request("mediaUrl 必须是字符串"))?
+                        .to_string();
+                    let mime_type = body
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png")
+                        .to_string();
+                    let media_id = body
+                        .get("mediaId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    send_image(state, to, media_url, mime_type, media_id)
+                }
+                "file" => {
+                    let media_url = body
+                        .get("mediaUrl")
+                        .or_else(|| body.get("fileUrl"))
+                        .or_else(|| body.get("url"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| AgentError::bad_request("mediaUrl 必须是字符串"))?
+                        .to_string();
+                    let file_name = body
+                        .get("fileName")
+                        .or_else(|| body.get("name"))
+                        .or_else(|| body.get("mediaId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    send_file(state, to, media_url, file_name)
+                }
+                _ => Err(AgentError::bad_request("当前仅支持 text/image/file 消息")),
+            }
         }
         _ => Err(AgentError {
             status: 404,

@@ -71,7 +71,7 @@ import {
   volRestoreArchive,
   initMessageAccess,
   pollMessages,
-  sendMessage,
+  sendAgentMessage,
   AgentRequestError,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
@@ -261,17 +261,13 @@ async function handlePoll(req: FastifyRequest, reply: FastifyReply, input: any) 
 app.post('/api/poll', async (req, reply) => handlePoll(req, reply, (req.body as any) ?? {}));
 app.get('/api/poll', async (req, reply) => handlePoll(req, reply, (req.query as any) ?? {}));
 
-// 发送文本消息。to 必须是 poll 返回的内部会话 id；ok 不表示微信服务端确认送达。
-app.post('/api/send', async (req, reply) => {
-  const body = (req.body as any) ?? {};
-  const inst = requireAccessibleInstance(req, reply, body.instanceId);
+// 发送消息。实例由 URL 指定，消息 body 原样转发给 Agent。
+app.post('/api/instances/:id/send', async (req, reply) => {
+  const { id } = req.params as any;
+  const inst = requireAccessibleInstance(req, reply, id);
   if (!inst) return;
-  if (body.type !== undefined && body.type !== 'text') return reply.code(400).send({ error: '当前仅支持 text 消息' });
-  if (typeof body.to !== 'string' || !body.to.trim()) return reply.code(400).send({ error: 'to 不能为空' });
-  if (typeof body.text !== 'string' || !body.text) return reply.code(400).send({ error: 'text 不能为空' });
-  if (body.text.length > 5000) return reply.code(400).send({ error: 'text 过长' });
   try {
-    const result = await sendMessage(inst, body.to.trim(), body.text);
+    const result = await sendAgentMessage(inst, (req.body as any) ?? {});
     return { ...result, instanceId: inst.id };
   } catch (e: any) {
     return sendAgentError(reply, e);
