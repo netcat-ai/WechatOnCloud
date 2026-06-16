@@ -25,15 +25,15 @@ The persistent storage owned by one WeChat Instance. It contains the WeChat Sess
 _Avoid_: Data folder, config, disk
 
 **WOC Agent**:
-The instance-scoped service responsible for message access inside a WeChat Instance. It owns WeChat-local state that should not live in the Panel.
+The instance-scoped Rust service responsible for message access inside a WeChat Instance. It owns Message Key persistence, local DB decrypt cache, polling cursors, and desktop-send automation; the Panel only proxies authorized requests.
 _Avoid_: Daemon, bot, worker
 
 **Message Access**:
-Programmatic reading and sending of WeChat messages for a WeChat Instance. It is separate from browser-based desktop operation of the same WeChat Session.
+Programmatic reading and sending of WeChat messages for a WeChat Instance. It is separate from browser-based desktop operation of the same WeChat Session. Send targets are stable internal conversation ids returned by polling, such as WeChat `username` / chatroom ids, not display names.
 _Avoid_: Chat API, bot API
 
 **Message Key**:
-The secret that allows Message Access to read encrypted local WeChat message data for a WeChat Instance. It belongs to the WeChat Instance, follows the lifecycle of its Instance Data Volume, and must be treated as sensitive session data.
+The per-database secret material that allows Message Access to read encrypted local WeChat message data for a WeChat Instance. `/agent/init` extracts it from the running WeChat process, writes the explicit DB-to-key mapping under the Instance Data Volume, and reuses that file on later starts.
 _Avoid_: Password, token, credential
 
 **Message Cursor**:

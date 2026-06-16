@@ -261,7 +261,7 @@ async function handlePoll(req: FastifyRequest, reply: FastifyReply, input: any) 
 app.post('/api/poll', async (req, reply) => handlePoll(req, reply, (req.body as any) ?? {}));
 app.get('/api/poll', async (req, reply) => handlePoll(req, reply, (req.query as any) ?? {}));
 
-// 发送文本消息。v1 的 ok 表示 WOC Agent 已接受并发起发送动作，不表示微信服务端确认送达。
+// 发送文本消息。to 必须是 poll 返回的内部会话 id；ok 不表示微信服务端确认送达。
 app.post('/api/send', async (req, reply) => {
   const body = (req.body as any) ?? {};
   const inst = requireAccessibleInstance(req, reply, body.instanceId);

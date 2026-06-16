@@ -1,8 +1,11 @@
-use anyhow::{anyhow, Context, Result};
+mod wechat_db;
+
+use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,7 +23,6 @@ struct AppState {
     state_dir: PathBuf,
     key_file: PathBuf,
     spool_file: PathBuf,
-    wx_cli: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +34,10 @@ struct KeyFile {
     source: Option<String>,
     #[serde(rename = "keysFile")]
     keys_file: Option<String>,
+    #[serde(rename = "dbDir", skip_serializing_if = "Option::is_none")]
+    db_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<HashMap<String, String>>,
     #[serde(rename = "createdAt")]
     created_at: i64,
     #[serde(rename = "updatedAt")]
@@ -39,9 +45,16 @@ struct KeyFile {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Cursor {
+struct SpoolCursor {
     v: u8,
     pos: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DbCursor {
+    v: u8,
+    source: String,
+    sessions: HashMap<String, i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,7 +117,6 @@ impl AppState {
         Self {
             key_file: state_dir.join("wechat.key"),
             spool_file: state_dir.join("messages.ndjson"),
-            wx_cli: find_wx_cli(),
             state_dir,
         }
     }
@@ -135,29 +147,77 @@ fn read_json_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> std::result::Res
     }
 }
 
-fn encode_cursor(pos: usize) -> String {
-    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Cursor { v: 1, pos }).unwrap())
+fn encode_spool_cursor(pos: usize) -> String {
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&SpoolCursor { v: 1, pos }).unwrap())
 }
 
-fn decode_cursor(raw: Option<&str>) -> std::result::Result<usize, AgentError> {
+fn decode_spool_cursor(raw: Option<&str>) -> std::result::Result<usize, AgentError> {
     let Some(raw) = raw.filter(|s| !s.is_empty()) else {
         return Ok(0);
     };
     let bytes = URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| AgentError::bad_request("cursor 不合法"))?;
-    let cursor: Cursor =
+    let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| AgentError::bad_request("cursor 不合法"))?;
+    if value.get("v").and_then(Value::as_u64) == Some(2) {
+        return Ok(0);
+    }
+    let cursor: SpoolCursor =
+        serde_json::from_value(value).map_err(|_| AgentError::bad_request("cursor 不合法"))?;
     if cursor.v != 1 {
         return Err(AgentError::bad_request("cursor 不合法"));
     }
     Ok(cursor.pos)
 }
 
+fn encode_db_cursor(sessions: &HashMap<String, i64>) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&DbCursor {
+            v: 2,
+            source: "db".to_string(),
+            sessions: sessions.clone(),
+        })
+        .unwrap(),
+    )
+}
+
+fn decode_db_cursor(
+    raw: Option<&str>,
+) -> std::result::Result<Option<HashMap<String, i64>>, AgentError> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| AgentError::bad_request("cursor 不合法"))?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| AgentError::bad_request("cursor 不合法"))?;
+    match value.get("v").and_then(Value::as_u64) {
+        Some(2) => {
+            let cursor: DbCursor = serde_json::from_value(value)
+                .map_err(|_| AgentError::bad_request("cursor 不合法"))?;
+            Ok(Some(cursor.sessions))
+        }
+        Some(1) => Ok(None),
+        _ => Err(AgentError::bad_request("cursor 不合法")),
+    }
+}
+
 fn read_key(state: &AppState) -> Result<KeyFile> {
     let data = fs::read_to_string(&state.key_file)?;
     let key: KeyFile = serde_json::from_str(&data)?;
-    if key.key.is_empty() {
+    let has_key_map = key
+        .keys
+        .as_ref()
+        .map(|keys| !keys.is_empty())
+        .unwrap_or(false);
+    let has_keys_file = key
+        .keys_file
+        .as_ref()
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false);
+    if key.key.is_empty() && !has_key_map && !has_keys_file {
         return Err(anyhow!("Message Key 文件无效"));
     }
     Ok(key)
@@ -172,8 +232,10 @@ fn write_key(state: &AppState, key: String, wxid: Option<String>) -> Result<KeyF
             .or_else(|| previous.as_ref().map(|p| p.wxid.clone()))
             .unwrap_or_default(),
         key,
-        source: previous.as_ref().and_then(|p| p.source.clone()),
-        keys_file: previous.as_ref().and_then(|p| p.keys_file.clone()),
+        source: Some("env".to_string()),
+        keys_file: None,
+        db_dir: None,
+        keys: None,
         created_at: previous.as_ref().map(|p| p.created_at).unwrap_or_else(now),
         updated_at: now(),
     };
@@ -188,8 +250,11 @@ fn write_key(state: &AppState, key: String, wxid: Option<String>) -> Result<KeyF
     Ok(doc)
 }
 
-fn write_wx_cli_key(state: &AppState, keys_file: PathBuf, wxid: Option<String>) -> Result<KeyFile> {
-    validate_wx_cli_keys_file(&keys_file)?;
+fn write_wechat_db_key(
+    state: &AppState,
+    init: wechat_db::InitData,
+    wxid: Option<String>,
+) -> Result<KeyFile> {
     state.ensure_state_dir()?;
     let previous = read_key(state).ok();
     let doc = KeyFile {
@@ -197,9 +262,11 @@ fn write_wx_cli_key(state: &AppState, keys_file: PathBuf, wxid: Option<String>) 
         wxid: wxid
             .or_else(|| previous.as_ref().map(|p| p.wxid.clone()))
             .unwrap_or_default(),
-        key: "wx-cli".to_string(),
-        source: Some("wx-cli".to_string()),
-        keys_file: Some(keys_file.to_string_lossy().to_string()),
+        key: "woc-agent".to_string(),
+        source: Some("woc-agent".to_string()),
+        keys_file: None,
+        db_dir: Some(init.db_dir.to_string_lossy().into_owned()),
+        keys: Some(init.keys),
         created_at: previous.as_ref().map(|p| p.created_at).unwrap_or_else(now),
         updated_at: now(),
     };
@@ -214,234 +281,53 @@ fn write_wx_cli_key(state: &AppState, keys_file: PathBuf, wxid: Option<String>) 
     Ok(doc)
 }
 
-fn validate_wx_cli_keys_file(keys_file: &PathBuf) -> Result<()> {
-    let raw = fs::read_to_string(keys_file)
-        .with_context(|| format!("读取 wx-cli keys 文件失败: {}", keys_file.display()))?;
-    let value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("解析 wx-cli keys 文件失败: {}", keys_file.display()))?;
-    let keys = value
-        .as_object()
-        .ok_or_else(|| anyhow!("wx-cli keys 文件不是 JSON object"))?;
-    let has_key = keys.values().any(|v| match v {
-        Value::String(s) => !s.trim().is_empty(),
-        Value::Object(obj) => obj.values().any(|inner| match inner {
-            Value::String(s) => !s.trim().is_empty(),
-            _ => !inner.is_null(),
-        }),
-        _ => !v.is_null(),
-    });
-    if !has_key {
-        return Err(anyhow!("wx-cli 未从内存提取到有效 Message Key"));
-    }
-    Ok(())
-}
-
-fn find_wx_cli() -> Option<PathBuf> {
-    let bundled = PathBuf::from("/woc/wx");
-    if bundled.exists() {
-        return Some(bundled);
-    }
-    env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths)
-            .map(|p| p.join("wx"))
-            .find(|p| p.exists())
-    })
-}
-
-fn wx_home() -> PathBuf {
-    PathBuf::from(env::var("WOC_WX_CLI_HOME").unwrap_or_else(|_| "/config".to_string()))
-}
-
-fn wx_cli_keys_file() -> PathBuf {
-    wx_home().join(".wx-cli").join("all_keys.json")
-}
-
-fn wx_cli_config_file() -> PathBuf {
-    wx_home().join(".wx-cli").join("config.json")
-}
-
-fn latest_db_mtime(dir: &PathBuf) -> Option<SystemTime> {
-    let mut latest = None;
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let mtime = if path.is_dir() {
-            latest_db_mtime(&path).unwrap_or(UNIX_EPOCH)
-        } else if path.extension().and_then(|s| s.to_str()) == Some("db") {
-            entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(UNIX_EPOCH)
-        } else {
-            continue;
-        };
-        latest = Some(latest.map_or(mtime, |cur| if mtime > cur { mtime } else { cur }));
-    }
-    latest
-}
-
-fn detect_woc_db_storage() -> Option<PathBuf> {
-    let base = wx_home().join("xwechat_files");
-    let mut candidates = Vec::new();
-    if let Ok(entries) = fs::read_dir(base) {
-        for entry in entries.flatten() {
-            let storage = entry.path().join("db_storage");
-            if storage.is_dir() {
-                candidates.push(storage);
-            }
-        }
-    }
-    candidates.sort_by_key(|p| latest_db_mtime(p).unwrap_or(UNIX_EPOCH));
-    candidates.into_iter().next_back()
-}
-
-fn ensure_wx_cli_config() -> Result<()> {
-    ensure_wx_cli_layout()?;
-    let config = wx_cli_config_file();
-    if config.exists() {
-        return Ok(());
-    }
-    let db_dir =
-        detect_woc_db_storage().ok_or_else(|| anyhow!("未找到 WOC 微信 db_storage 目录"))?;
-    let cli_dir = wx_home().join(".wx-cli");
-    fs::create_dir_all(&cli_dir)?;
-    let doc = json!({
-        "db_dir": db_dir,
-        "keys_file": wx_cli_keys_file(),
-        "decrypted_dir": cli_dir.join("decrypted"),
-        "wechat_process": "wechat"
-    });
-    fs::write(&config, serde_json::to_vec_pretty(&doc)?)?;
-    Ok(())
-}
-
-fn ensure_wx_cli_layout() -> Result<()> {
-    let source = wx_home().join("xwechat_files");
-    if !source.exists() {
-        return Ok(());
-    }
-    let documents = wx_home().join("Documents");
-    let compat = documents.join("xwechat_files");
-    if compat.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(&documents)?;
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&source, &compat)
-            .with_context(|| format!("创建 wx-cli 兼容路径失败: {}", compat.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = source;
-    }
-    Ok(())
-}
-
-fn run_wx_cli(wx: &PathBuf, args: &[&str]) -> Result<Value> {
-    ensure_wx_cli_config()?;
-    let output = Command::new(wx)
-        .args(args)
-        .env("HOME", wx_home())
-        .env("WX_HOME", wx_home())
-        .output()
-        .with_context(|| format!("执行 wx-cli 失败: {}", wx.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(anyhow!(
-            "{}",
-            if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            }
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        Ok(json!({}))
-    } else {
-        serde_json::from_str(stdout.trim()).or_else(|_| Ok(json!({ "raw": stdout.trim() })))
-    }
-}
-
-fn init_with_wx_cli(
-    state: &AppState,
-    wx: &PathBuf,
-    wxid: Option<String>,
-) -> std::result::Result<KeyFile, AgentError> {
-    run_wx_cli(wx, &["init", "--force"])
-        .map_err(|e| AgentError::internal(format!("wx-cli init 失败：{e}")))?;
-    let keys_file = wx_cli_keys_file();
-    if !keys_file.exists() {
-        return Err(AgentError::internal(format!(
-            "wx-cli init 未生成 keys 文件：{}",
-            keys_file.display()
-        )));
-    }
-    write_wx_cli_key(state, keys_file, wxid).map_err(|e| AgentError::internal(e.to_string()))
-}
-
-fn poll_with_wx_cli(wx: &PathBuf, limit: usize) -> std::result::Result<Value, AgentError> {
-    let limit_s = limit.to_string();
-    let raw = run_wx_cli(wx, &["new-messages", "--json", "-n", &limit_s])
-        .or_else(|_| run_wx_cli(wx, &["new-messages", "--json", "--limit", &limit_s]))
-        .or_else(|_| run_wx_cli(wx, &["new-messages", "--json"]))
-        .map_err(|e| AgentError::internal(format!("wx-cli new-messages 失败：{e}")))?;
-    let messages = raw
-        .get("messages")
-        .cloned()
-        .or_else(|| raw.get("data").cloned())
-        .or_else(|| {
-            if raw.is_array() {
-                Some(raw.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| json!([]));
-    Ok(json!({
-        "cursor": encode_cursor(now() as usize),
-        "messages": messages,
-        "meta": {
-            "source": "wx-cli",
-            "raw": raw
-        }
-    }))
-}
-
-fn extract_key_from_memory() -> Result<String> {
-    if let Ok(key) = env::var("WOC_AGENT_INIT_KEY") {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return Ok(key);
-        }
-    }
-    let helper = PathBuf::from("/woc/woc-key");
-    if helper.exists() {
-        let out = Command::new(helper)
-            .output()
-            .context("执行 Message Key 提取器失败")?;
-        if out.status.success() {
-            let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !key.is_empty() {
-                return Ok(key);
-            }
-        }
-    }
-    let pgrep = Command::new("pgrep").args(["-f", "wechat|WeChat"]).output();
-    if pgrep.map(|o| !o.stdout.is_empty()).unwrap_or(false) {
-        return Err(anyhow!("当前镜像尚未提供 Message Key 内存提取器"));
-    }
-    Err(anyhow!("未找到微信进程，无法从内存初始化 Message Key"))
-}
-
 fn current_cursor(state: &AppState) -> String {
+    if let Ok(key) = read_key(state) {
+        if let Ok(Some((db_dir, keys))) = key_db_material(&key) {
+            if let Ok(session_state) =
+                wechat_db::current_session_state(db_dir, keys, state.state_dir.join("cache"))
+            {
+                return encode_db_cursor(&session_state);
+            }
+            return encode_db_cursor(&HashMap::new());
+        }
+    }
     let count = read_spool_lines(state)
         .map(|lines| lines.len())
         .unwrap_or(0);
-    encode_cursor(count)
+    encode_spool_cursor(count)
+}
+
+fn key_db_material(key: &KeyFile) -> Result<Option<(PathBuf, HashMap<String, String>)>> {
+    if let (Some(db_dir), Some(keys)) = (&key.db_dir, &key.keys) {
+        if !keys.is_empty() {
+            return Ok(Some((PathBuf::from(db_dir), keys.clone())));
+        }
+    }
+    if let Some(keys_file) = key
+        .keys_file
+        .as_ref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let keys = wechat_db::read_keys_file(&PathBuf::from(keys_file))?;
+        let db_dir = key
+            .db_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(wechat_db::detect_db_storage)
+            .ok_or_else(|| anyhow!("未找到 WOC 微信 db_storage 目录"))?;
+        return Ok(Some((db_dir, keys)));
+    }
+    Ok(None)
+}
+
+fn init_from_memory(
+    state: &AppState,
+    wxid: Option<String>,
+) -> std::result::Result<KeyFile, AgentError> {
+    let init = wechat_db::init_from_memory()
+        .map_err(|e| AgentError::internal(format!("Message Key 初始化失败：{e}")))?;
+    write_wechat_db_key(state, init, wxid).map_err(|e| AgentError::internal(e.to_string()))
 }
 
 fn read_spool_lines(state: &AppState) -> Result<Vec<AgentMessage>> {
@@ -470,13 +356,36 @@ fn poll_messages(
     if !state.key_file.exists() {
         return Err(AgentError::conflict("KEY_REQUIRED"));
     }
-    if let Some(wx) = &state.wx_cli {
-        let key = read_key(state).map_err(|e| AgentError::internal(e.to_string()))?;
-        if key.source.as_deref() == Some("wx-cli") {
-            return poll_with_wx_cli(wx, limit);
-        }
+    let key = read_key(state).map_err(|e| AgentError::internal(e.to_string()))?;
+    if let Some((db_dir, keys)) =
+        key_db_material(&key).map_err(|e| AgentError::internal(e.to_string()))?
+    {
+        let cursor_state = decode_db_cursor(cursor)?;
+        let data = wechat_db::poll_new_messages(
+            db_dir,
+            keys,
+            cursor_state,
+            limit,
+            state.state_dir.join("cache"),
+        )
+        .map_err(|e| AgentError::internal(format!("读取新消息失败：{e}")))?;
+        let wechat_db::PollData {
+            messages,
+            new_state,
+            meta,
+        } = data;
+        let cursor = encode_db_cursor(&new_state);
+        return Ok(json!({
+            "cursor": cursor,
+            "messages": messages,
+            "meta": {
+                "source": "woc-agent",
+                "newState": new_state,
+                "raw": meta
+            }
+        }));
     }
-    let pos = decode_cursor(cursor)?;
+    let pos = decode_spool_cursor(cursor)?;
     let messages = read_spool_lines(state).map_err(|e| AgentError::internal(e.to_string()))?;
     let next_pos = messages.len().min(pos.saturating_add(limit));
     let slice = if pos >= messages.len() {
@@ -484,7 +393,7 @@ fn poll_messages(
     } else {
         &messages[pos..next_pos]
     };
-    Ok(json!({ "cursor": encode_cursor(next_pos), "messages": slice }))
+    Ok(json!({ "cursor": encode_spool_cursor(next_pos), "messages": slice }))
 }
 
 fn append_spool_message(state: &AppState, message: &AgentMessage) -> Result<()> {
@@ -502,7 +411,49 @@ fn shell_quote_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[derive(Debug, Clone)]
+struct SendTarget {
+    id: String,
+    query: String,
+    is_group: bool,
+    search_uses_remark: bool,
+}
+
+fn resolve_send_target(state: &AppState, to: &str) -> std::result::Result<SendTarget, AgentError> {
+    if let Ok(key) = read_key(state) {
+        if let Ok(Some((db_dir, keys))) = key_db_material(&key) {
+            match wechat_db::resolve_recipient_by_username(
+                db_dir,
+                keys,
+                state.state_dir.join("cache"),
+                to,
+            ) {
+                Ok(Some(recipient)) => {
+                    return Ok(SendTarget {
+                        id: recipient.username,
+                        query: recipient.display,
+                        is_group: recipient.is_group,
+                        search_uses_remark: recipient.search_uses_remark,
+                    });
+                }
+                Ok(None) => {
+                    return Err(AgentError::bad_request(
+                        "未找到收件人：to 必须是 poll 返回的内部 id",
+                    ));
+                }
+                Err(e) => {
+                    return Err(AgentError::bad_request(format!("收件人解析失败：{e}")));
+                }
+            }
+        }
+    }
+    Err(AgentError::bad_request(
+        "无法解析收件人，请先完成 /api/init",
+    ))
+}
+
 fn send_text(state: &AppState, to: String, text: String) -> std::result::Result<Value, AgentError> {
+    let to = to.trim().to_string();
     if to.trim().is_empty() || to.len() > 200 {
         return Err(AgentError::bad_request("收件人为空或过长"));
     }
@@ -527,7 +478,13 @@ fn send_text(state: &AppState, to: String, text: String) -> std::result::Result<
         return Ok(json!({ "ok": true, "clientMsgId": client_msg_id, "accepted": true }));
     }
 
-    let b64_to = STANDARD.encode(to.as_bytes());
+    let target = resolve_send_target(state, &to)?;
+    if target.is_group && !target.search_uses_remark {
+        return Err(AgentError::bad_request(
+            "群聊发送必须先设置唯一备注，避免微信搜索误选会话",
+        ));
+    }
+    let b64_to = STANDARD.encode(target.query.as_bytes());
     let b64_text = STANDARD.encode(text.as_bytes());
     let script = [
         "set -e".to_string(),
@@ -536,22 +493,41 @@ fn send_text(state: &AppState, to: String, text: String) -> std::result::Result<
         "export DISPLAY=\"${display:-:1}\"".to_string(),
         "command -v xclip >/dev/null 2>&1 || { echo \"xclip not installed\" >&2; exit 127; }".to_string(),
         "command -v xdotool >/dev/null 2>&1 || { echo \"xdotool not installed\" >&2; exit 127; }".to_string(),
-        "win=\"$(xdotool search --onlyvisible --name \"微信\\|WeChat\" 2>/dev/null | head -n1 || true)\"".to_string(),
+        "command -v timeout >/dev/null 2>&1 || { echo \"timeout not installed\" >&2; exit 127; }".to_string(),
+        "clip_pid=\"\"".to_string(),
+        "cleanup_clip() { if [ -n \"${clip_pid:-}\" ]; then kill \"$clip_pid\" 2>/dev/null || true; wait \"$clip_pid\" 2>/dev/null || true; clip_pid=\"\"; fi; }".to_string(),
+        "set_clip() { cleanup_clip; printf '%s' \"$1\" | base64 -d | xclip -selection clipboard -target UTF8_STRING -loops 5 -i >/dev/null 2>&1 & clip_pid=$!; sleep 0.25; }".to_string(),
+        "paste_clip() { xdotool key --clearmodifiers ctrl+v; for i in $(seq 1 30); do if ! kill -0 \"$clip_pid\" 2>/dev/null; then wait \"$clip_pid\" 2>/dev/null || true; clip_pid=\"\"; sleep 0.1; return 0; fi; sleep 0.1; done; echo \"微信未读取剪贴板\" >&2; return 3; }".to_string(),
+        "trap cleanup_clip EXIT".to_string(),
+        "if command -v xprop >/dev/null 2>&1; then for browser_win in $({ xdotool search --name '微信' 2>/dev/null || true; xdotool search --name 'WeChat' 2>/dev/null || true; } | sort -u); do class=\"$(xprop -id \"$browser_win\" WM_CLASS 2>/dev/null || true)\"; case \"$class\" in *wechat*) ;; *) xdotool windowclose \"$browser_win\" 2>/dev/null || true; sleep 0.3;; esac; done; fi".to_string(),
+        "win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || { active=\"$(xdotool getactivewindow 2>/dev/null || true)\"; active_name=\"\"; if [ -n \"$active\" ]; then active_name=\"$(xdotool getwindowname \"$active\" 2>/dev/null || true)\"; case \"$active_name\" in *微信*|*WeChat*) win=\"$active\";; esac; fi; }".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --name '微信' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --name 'WeChat' 2>/dev/null | tail -n1 || true)\"".to_string(),
+        "[ -n \"$win\" ] || win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"".to_string(),
         "[ -n \"$win\" ] || { echo \"未找到可见微信窗口\" >&2; exit 2; }".to_string(),
         "xdotool windowactivate \"$win\"".to_string(),
         "sleep 0.2".to_string(),
-        "xdotool key --clearmodifiers ctrl+f".to_string(),
-        format!("echo {} | base64 -d | xclip -selection clipboard -i", shell_quote_single(&b64_to)),
-        "xdotool key --clearmodifiers ctrl+v".to_string(),
+        "eval \"$(xdotool getwindowgeometry --shell \"$win\")\"".to_string(),
+        "root_x=${X:-0}; root_y=${Y:-0}; root_w=${WIDTH:-1856}; root_h=${HEIGHT:-857}".to_string(),
+        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 157)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
+        "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
+        "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
+            + &format!("set_clip {}", shell_quote_single(&b64_to))
+            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Return",
+        "sleep 1.5; xdotool key --clearmodifiers Escape; sleep 0.2".to_string(),
+        "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
         "sleep 0.2".to_string(),
-        "xdotool key --clearmodifiers Return".to_string(),
+        "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
         "sleep 0.2".to_string(),
-        format!("echo {} | base64 -d | xclip -selection clipboard -i", shell_quote_single(&b64_text)),
-        "xdotool key --clearmodifiers ctrl+v".to_string(),
-        "xdotool key --clearmodifiers Return".to_string(),
+        format!("set_clip {}", shell_quote_single(&b64_text)),
+        "paste_clip".to_string(),
+        "sleep 0.2".to_string(),
+        "xdotool mousemove \"$send_x\" \"$send_y\" click 1".to_string(),
+        "sleep 0.5".to_string(),
     ].join("; ");
-    let output = Command::new("bash")
-        .args(["-lc", &script])
+    let output = Command::new("timeout")
+        .args(["60s", "bash", "-lc", &script])
         .output()
         .map_err(|e| AgentError::internal(e.to_string()))?;
     if !output.status.success() {
@@ -567,7 +543,16 @@ fn send_text(state: &AppState, to: String, text: String) -> std::result::Result<
         )));
     }
     append_spool_message(state, &message).map_err(|e| AgentError::internal(e.to_string()))?;
-    Ok(json!({ "ok": true, "clientMsgId": client_msg_id, "accepted": true }))
+    Ok(json!({
+        "ok": true,
+        "clientMsgId": client_msg_id,
+        "accepted": true,
+        "target": {
+            "id": target.id,
+            "query": target.query,
+            "isGroup": target.is_group
+        }
+    }))
 }
 
 fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, AgentError> {
@@ -587,19 +572,8 @@ fn handle(state: &AppState, req: HttpRequest) -> std::result::Result<Value, Agen
                                 .map_err(|e| AgentError::internal(e.to_string()))?,
                             "memory",
                         )
-                    } else if let Some(wx) = &state.wx_cli {
-                        (init_with_wx_cli(state, wx, wxid)?, "memory")
                     } else {
-                        (
-                            write_key(
-                                state,
-                                extract_key_from_memory()
-                                    .map_err(|e| AgentError::internal(e.to_string()))?,
-                                wxid,
-                            )
-                            .map_err(|e| AgentError::internal(e.to_string()))?,
-                            "memory",
-                        )
+                        (init_from_memory(state, wxid)?, "memory")
                     }
                 }
             };
@@ -730,15 +704,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_round_trips_position() {
-        let encoded = encode_cursor(42);
-        assert_eq!(decode_cursor(Some(&encoded)).unwrap(), 42);
-        assert_eq!(decode_cursor(None).unwrap(), 0);
+    fn spool_cursor_round_trips_position() {
+        let encoded = encode_spool_cursor(42);
+        assert_eq!(decode_spool_cursor(Some(&encoded)).unwrap(), 42);
+        assert_eq!(decode_spool_cursor(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn db_cursor_round_trips_session_state() {
+        let sessions = HashMap::from([("wxid_test".to_string(), 123_i64)]);
+        let encoded = encode_db_cursor(&sessions);
+        assert_eq!(decode_db_cursor(Some(&encoded)).unwrap().unwrap(), sessions);
+        assert!(decode_db_cursor(None).unwrap().is_none());
     }
 
     #[test]
     fn invalid_cursor_is_rejected() {
-        assert!(decode_cursor(Some("not-a-cursor")).is_err());
+        assert!(decode_db_cursor(Some("not-a-cursor")).is_err());
+    }
+
+    #[test]
+    fn db_poll_accepts_legacy_spool_cursor_as_empty_state() {
+        let encoded = encode_spool_cursor(42);
+        assert!(decode_db_cursor(Some(&encoded)).unwrap().is_none());
     }
 
     #[test]
@@ -748,7 +736,6 @@ mod tests {
             key_file: dir.join("wechat.key"),
             spool_file: dir.join("messages.ndjson"),
             state_dir: dir.clone(),
-            wx_cli: None,
         };
         let key = write_key(
             &state,
@@ -757,6 +744,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key.key, "test-key");
+        assert_eq!(key.source.as_deref(), Some("env"));
         assert_eq!(read_key(&state).unwrap().wxid, "wxid_test");
         #[cfg(unix)]
         {
@@ -768,27 +756,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_wx_cli_keys_file_is_rejected() {
-        let dir = env::temp_dir().join(format!("woc-agent-test-{}", Uuid::new_v4().simple()));
-        fs::create_dir_all(&dir).unwrap();
-        let keys_file = dir.join("all_keys.json");
-        fs::write(&keys_file, "{}").unwrap();
-
-        let err = validate_wx_cli_keys_file(&keys_file).unwrap_err();
+    fn empty_keys_json_is_rejected() {
+        let err = wechat_db::parse_keys_value(&json!({})).unwrap_err();
         assert!(err.to_string().contains("Message Key"));
-
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn non_empty_wx_cli_keys_file_is_accepted() {
-        let dir = env::temp_dir().join(format!("woc-agent-test-{}", Uuid::new_v4().simple()));
-        fs::create_dir_all(&dir).unwrap();
-        let keys_file = dir.join("all_keys.json");
-        fs::write(&keys_file, r#"{"message_0.db":"0123456789abcdef"}"#).unwrap();
-
-        validate_wx_cli_keys_file(&keys_file).unwrap();
-
-        fs::remove_dir_all(dir).unwrap();
+    fn non_empty_keys_json_is_accepted() {
+        let keys = wechat_db::parse_keys_value(&json!({
+            "message/message_0.db": { "enc_key": "0123456789abcdef" }
+        }))
+        .unwrap();
+        assert_eq!(
+            keys.get("message/message_0.db").map(String::as_str),
+            Some("0123456789abcdef")
+        );
     }
 }

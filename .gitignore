@@ -141,3 +141,9 @@ dist
 /data-panel/
 /.claude
 .DS_Store
+
+# Local agent build/test artifacts
+/docker/woc-agent-rs/target/
+/docker/woc-agent-rs/target-linux/
+/.playwright-mcp/
+/woc-send-verify.png

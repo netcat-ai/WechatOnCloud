@@ -513,6 +513,11 @@ export interface AgentSendResponse {
   ok: boolean;
   clientMsgId: string;
   accepted: boolean;
+  target?: {
+    id: string;
+    query: string;
+    isGroup: boolean;
+  };
 }
 
 async function requestAgent<T>(inst: Instance, path: '/agent/init' | '/agent/poll' | '/agent/send', body: any): Promise<T> {
