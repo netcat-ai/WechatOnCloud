@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1281,6 +1282,12 @@ fn decode_dat_image(
         data
     };
 
+    let data = if data.starts_with(b"wxgf") {
+        convert_wxgf_to_jpeg(&data)?
+    } else {
+        data
+    };
+
     let content_type = detect_media_content_type(&data);
     if content_type == "application/octet-stream" {
         bail!("图片解码产物不是可识别图片格式");
@@ -1291,6 +1298,61 @@ fn decode_dat_image(
         content_type,
         filename: format!("{file_md5}.{ext}"),
     })
+}
+
+fn convert_wxgf_to_jpeg(data: &[u8]) -> Result<Vec<u8>> {
+    let Some(hevc_payload) = wxgf_hevc_payload(data) else {
+        bail!("wxgf 缺少 HEVC payload");
+    };
+
+    let tmp = std::env::temp_dir();
+    let id = uuid::Uuid::new_v4();
+    let input_path = tmp.join(format!("woc-wxgf-{id}.h265"));
+    let output_path = tmp.join(format!("woc-wxgf-{id}.jpg"));
+    fs::write(&input_path, hevc_payload)
+        .with_context(|| format!("写入 wxgf 临时输入失败: {}", input_path.display()))?;
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "hevc",
+            "-i",
+            input_path.to_string_lossy().as_ref(),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .output();
+
+    let _ = fs::remove_file(&input_path);
+    let output = output.context("启动 ffmpeg 转换 wxgf 失败")?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg 转换 wxgf 失败: {}", stderr.trim());
+    }
+
+    let jpeg = fs::read(&output_path)
+        .with_context(|| format!("读取 ffmpeg JPEG 输出失败: {}", output_path.display()))?;
+    let _ = fs::remove_file(&output_path);
+    if detect_media_content_type(&jpeg) != "image/jpeg" {
+        bail!("ffmpeg 转换 wxgf 后未生成 JPEG");
+    }
+    Ok(jpeg)
+}
+
+fn wxgf_hevc_payload(data: &[u8]) -> Option<&[u8]> {
+    if !data.starts_with(b"wxgf") {
+        return None;
+    }
+    let start = find_subslice(data, b"\x00\x00\x00\x01")?;
+    Some(&data[start..])
 }
 
 fn decode_v2_image(file_bytes: &[u8], aes_key: &[u8; 16], xor_key: u8) -> Result<Vec<u8>> {
@@ -2378,6 +2440,16 @@ mod tests {
         );
         assert_eq!(detect_media_content_type(b"GIF89a"), "image/gif");
         assert_eq!(detect_media_content_type(b"wxgfxxxx"), "image/heic");
+    }
+
+    #[test]
+    fn extracts_wxgf_hevc_payload() {
+        let data = b"wxgf private header\x00\x00\x00\x01\x40\x01payload";
+        assert_eq!(
+            wxgf_hevc_payload(data).unwrap(),
+            b"\x00\x00\x00\x01\x40\x01payload"
+        );
+        assert!(wxgf_hevc_payload(b"\x00\x00\x00\x01\x40\x01payload").is_none());
     }
 
     #[test]
