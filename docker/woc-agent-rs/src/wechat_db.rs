@@ -1,6 +1,7 @@
 // Portions of this module are adapted from jackwener/wx-cli (Apache-2.0).
 // The agent keeps this code in-process so message state and HTTP cursors stay owned by WOC.
-use aes::Aes256;
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+use aes::{Aes128, Aes256};
 use anyhow::{anyhow, bail, Context, Result};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::Decryptor;
@@ -11,6 +12,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEX_PATTERN_LEN: usize = 96;
@@ -21,6 +24,9 @@ const RESERVE_SZ: usize = 80;
 const WAL_HDR_SZ: usize = 32;
 const WAL_FRAME_HDR: usize = 24;
 const SQLITE_HDR: &[u8] = b"SQLite format 3\x00";
+const V2_IMAGE_MAGIC: [u8; 6] = [0x07, 0x08, b'V', b'2', 0x08, 0x07];
+const V1_IMAGE_MAGIC: [u8; 6] = [0x07, 0x08, b'V', b'1', 0x08, 0x07];
+const V2_IMAGE_HEADER_SIZE: usize = 15;
 
 type Aes256CbcDec = Decryptor<Aes256>;
 type Block = aes::cipher::Block<Aes256>;
@@ -50,6 +56,12 @@ pub struct MediaFile {
     pub data: Vec<u8>,
     pub content_type: String,
     pub filename: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageKeyMaterial {
+    aes_key: [u8; 16],
+    xor_key: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -228,10 +240,22 @@ pub fn read_image_media(
         .parent()
         .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?
         .to_path_buf();
+    let attach_root = account_dir.join("msg").join("attach");
     for shard in shards {
-        if let Some((content, create_time)) =
+        if let Some((content, create_time, local_type)) =
             image_message_content(&shard.path, &shard.table, local_id)?
         {
+            if let Some(media) = find_resource_image_file(
+                &mut db,
+                &account_dir,
+                &attach_root,
+                roomid,
+                local_id,
+                create_time,
+                local_type,
+            )? {
+                return Ok(Some(media));
+            }
             if let Some(media) = find_image_file(&account_dir, local_id, create_time, &content)? {
                 return Ok(Some(media));
             }
@@ -1005,7 +1029,7 @@ fn image_message_content(
     db_path: &Path,
     table: &str,
     local_id: i64,
-) -> Result<Option<(String, i64)>> {
+) -> Result<Option<(String, i64, i64)>> {
     let conn = Connection::open(db_path)?;
     let sql = format!(
         "SELECT local_type, create_time, message_content, WCDB_CT_message_content
@@ -1025,10 +1049,15 @@ fn image_message_content(
     let Some((local_type, create_time, content_bytes, ct)) = row else {
         return Ok(None);
     };
-    if !matches!(base_type(local_type), 3 | 49) {
+    let local_type = base_type(local_type);
+    if !matches!(local_type, 3 | 49) {
         return Ok(None);
     }
-    Ok(Some((decompress_message(&content_bytes, ct), create_time)))
+    Ok(Some((
+        decompress_message(&content_bytes, ct),
+        create_time,
+        local_type,
+    )))
 }
 
 fn find_image_file(
@@ -1063,6 +1092,586 @@ fn find_image_file(
         }
     }
     Ok(None)
+}
+
+fn find_resource_image_file(
+    db: &mut DbCache,
+    account_dir: &Path,
+    attach_root: &Path,
+    roomid: &str,
+    local_id: i64,
+    create_time: i64,
+    local_type: i64,
+) -> Result<Option<MediaFile>> {
+    let Some(resource_db) = db.get("message/message_resource.db")? else {
+        return Ok(None);
+    };
+
+    let mut candidate_types = vec![local_type];
+    if local_type != 3 {
+        candidate_types.push(3);
+    }
+
+    for msg_type in candidate_types {
+        let Some(file_md5) =
+            lookup_resource_md5(&resource_db, roomid, local_id, create_time, msg_type)?
+        else {
+            continue;
+        };
+        let Some(dat_path) = find_dat_file(attach_root, roomid, &file_md5) else {
+            continue;
+        };
+        let media = decode_dat_image(account_dir, attach_root, &dat_path, &file_md5)
+            .with_context(|| format!("解码本地图片失败: {}", dat_path.display()))?;
+        return Ok(Some(media));
+    }
+    Ok(None)
+}
+
+fn lookup_resource_md5(
+    resource_db_path: &Path,
+    chat: &str,
+    local_id: i64,
+    create_time: i64,
+    msg_local_type_lo32: i64,
+) -> Result<Option<String>> {
+    let conn = Connection::open(resource_db_path).with_context(|| {
+        format!(
+            "打开 message_resource.db 失败: {}",
+            resource_db_path.display()
+        )
+    })?;
+    let chat_id: Option<i64> = conn
+        .query_row(
+            "SELECT rowid FROM ChatName2Id WHERE user_name = ?1",
+            [chat],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(chat_id) = chat_id else {
+        return Ok(None);
+    };
+
+    let packed_exact: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT packed_info FROM MessageResourceInfo
+             WHERE chat_id = ?1
+               AND message_local_id = ?2
+               AND (message_local_type = ?3 OR message_local_type % 4294967296 = ?3)
+               AND message_create_time = ?4
+             ORDER BY rowid DESC
+             LIMIT 1",
+            rusqlite::params![chat_id, local_id, msg_local_type_lo32, create_time],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let packed = match packed_exact {
+        Some(blob) => Some(blob),
+        None => conn
+            .query_row(
+                "SELECT packed_info FROM MessageResourceInfo
+                 WHERE chat_id = ?1
+                   AND message_local_id = ?2
+                   AND (message_local_type = ?3 OR message_local_type % 4294967296 = ?3)
+                 ORDER BY message_create_time DESC
+                 LIMIT 1",
+                rusqlite::params![chat_id, local_id, msg_local_type_lo32],
+                |row| row.get(0),
+            )
+            .optional()?,
+    };
+
+    let Some(blob) = packed else {
+        return Ok(None);
+    };
+    Ok(extract_resource_md5_from_packed_info(&blob))
+}
+
+fn extract_resource_md5_from_packed_info(blob: &[u8]) -> Option<String> {
+    const MARKER: &[u8; 4] = &[0x12, 0x22, 0x0A, 0x20];
+
+    if let Some(pos) = find_subslice(blob, MARKER) {
+        let start = pos + MARKER.len();
+        if start + 32 <= blob.len() {
+            if let Ok(value) = std::str::from_utf8(&blob[start..start + 32]) {
+                if is_hex_like(value, 32) {
+                    return Some(value.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    if blob.len() >= 32 {
+        for start in 0..=blob.len() - 32 {
+            let chunk = &blob[start..start + 32];
+            if let Ok(value) = std::str::from_utf8(chunk) {
+                if is_hex_like(value, 32) {
+                    return Some(value.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn find_dat_file(attach_root: &Path, chat: &str, file_md5: &str) -> Option<PathBuf> {
+    let chat_hash = format!("{:x}", md5::compute(chat.as_bytes()));
+    let chat_dir = attach_root.join(chat_hash);
+    if !chat_dir.is_dir() {
+        return None;
+    }
+
+    let mut months: Vec<PathBuf> = fs::read_dir(&chat_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    months.sort();
+    for month_dir in months {
+        if let Some(path) = pick_best_in_img_dir(&month_dir.join("Img"), file_md5) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn pick_best_in_img_dir(img_dir: &Path, file_md5: &str) -> Option<PathBuf> {
+    if !img_dir.is_dir() {
+        return None;
+    }
+    for suffix in [".dat", "_h.dat", "_t.dat"] {
+        let path = img_dir.join(format!("{file_md5}{suffix}"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn decode_dat_image(
+    account_dir: &Path,
+    attach_root: &Path,
+    path: &Path,
+    file_md5: &str,
+) -> Result<MediaFile> {
+    let data = fs::read(path)?;
+    let direct_content_type = detect_media_content_type(&data);
+    let data = if direct_content_type == "application/octet-stream" {
+        if data.starts_with(&V2_IMAGE_MAGIC) {
+            let key = image_key_for_account(account_dir, attach_root)?;
+            decode_v2_image(&data, &key.aes_key, key.xor_key)?
+        } else if data.starts_with(&V1_IMAGE_MAGIC) {
+            let fixed_key: [u8; 16] = *b"cfcd208495d565ef";
+            decode_v2_image(&data, &fixed_key, 0x88)?
+        } else {
+            decode_legacy_xor_image(&data)?
+        }
+    } else {
+        data
+    };
+
+    let content_type = detect_media_content_type(&data);
+    if content_type == "application/octet-stream" {
+        bail!("图片解码产物不是可识别图片格式");
+    }
+    let ext = extension_for_content_type(&content_type);
+    Ok(MediaFile {
+        data,
+        content_type,
+        filename: format!("{file_md5}.{ext}"),
+    })
+}
+
+fn decode_v2_image(file_bytes: &[u8], aes_key: &[u8; 16], xor_key: u8) -> Result<Vec<u8>> {
+    if file_bytes.len() < V2_IMAGE_HEADER_SIZE {
+        bail!("V2 图片文件过短");
+    }
+    let magic: &[u8; 6] = file_bytes[..6].try_into().unwrap();
+    if magic != &V2_IMAGE_MAGIC && magic != &V1_IMAGE_MAGIC {
+        bail!("V2 图片 header magic 不匹配");
+    }
+
+    let aes_size = u32::from_le_bytes(file_bytes[6..10].try_into().unwrap()) as usize;
+    let xor_size = u32::from_le_bytes(file_bytes[10..14].try_into().unwrap()) as usize;
+    let aligned_aes_size = aes_size + (16 - (aes_size % 16));
+    let aes_end = V2_IMAGE_HEADER_SIZE
+        .checked_add(aligned_aes_size)
+        .ok_or_else(|| anyhow!("V2 图片 AES 段长度溢出"))?;
+    if aes_end > file_bytes.len() {
+        bail!("V2 图片 AES 段超过文件长度");
+    }
+    let raw_end = file_bytes
+        .len()
+        .checked_sub(xor_size)
+        .ok_or_else(|| anyhow!("V2 图片 XOR 段超过文件长度"))?;
+    if aes_end > raw_end {
+        bail!("V2 图片 AES/XOR 段重叠");
+    }
+
+    let aes_data = aes_ecb_decrypt_pkcs7(aes_key, &file_bytes[V2_IMAGE_HEADER_SIZE..aes_end])?;
+    let raw_data = &file_bytes[aes_end..raw_end];
+    let xor_data = file_bytes[raw_end..]
+        .iter()
+        .map(|byte| byte ^ xor_key)
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::with_capacity(aes_data.len() + raw_data.len() + xor_data.len());
+    out.extend_from_slice(&aes_data);
+    out.extend_from_slice(raw_data);
+    out.extend_from_slice(&xor_data);
+    Ok(out)
+}
+
+fn aes_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
+    if cipher.is_empty() || cipher.len() % 16 != 0 {
+        bail!("AES 输入长度不是 16 的倍数");
+    }
+    let aes = Aes128::new(key.into());
+    let mut out = Vec::with_capacity(cipher.len());
+    for chunk in cipher.chunks_exact(16) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        aes.decrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    let pad = *out.last().ok_or_else(|| anyhow!("AES 解密输出为空"))? as usize;
+    if pad == 0 || pad > 16 || pad > out.len() {
+        bail!("AES PKCS7 padding 长度非法");
+    }
+    if !out[out.len() - pad..]
+        .iter()
+        .all(|byte| *byte as usize == pad)
+    {
+        bail!("AES PKCS7 padding 字节非法");
+    }
+    out.truncate(out.len() - pad);
+    Ok(out)
+}
+
+fn decode_legacy_xor_image(file_bytes: &[u8]) -> Result<Vec<u8>> {
+    let key =
+        detect_legacy_xor_key(file_bytes).ok_or_else(|| anyhow!("无法识别 legacy XOR 图片"))?;
+    Ok(file_bytes.iter().map(|byte| byte ^ key).collect())
+}
+
+fn detect_legacy_xor_key(file_bytes: &[u8]) -> Option<u8> {
+    if file_bytes.len() < 4 {
+        return None;
+    }
+    let header = &file_bytes[..file_bytes.len().min(16)];
+    for magic in [
+        b"\x89PNG".as_slice(),
+        b"GIF8".as_slice(),
+        &[0x49, 0x49, 0x2A, 0x00],
+        b"RIFF".as_slice(),
+        &[0xFF, 0xD8, 0xFF],
+    ] {
+        if let Some(key) = detect_xor_key_for_magic(header, magic) {
+            return Some(key);
+        }
+    }
+    detect_bmp_xor_key(file_bytes, header)
+}
+
+fn detect_xor_key_for_magic(header: &[u8], magic: &[u8]) -> Option<u8> {
+    if header.len() < magic.len() {
+        return None;
+    }
+    let key = header[0] ^ magic[0];
+    magic
+        .iter()
+        .enumerate()
+        .all(|(idx, expected)| header[idx] ^ key == *expected)
+        .then_some(key)
+}
+
+fn detect_bmp_xor_key(file_bytes: &[u8], header: &[u8]) -> Option<u8> {
+    let key = detect_xor_key_for_magic(header, b"BM")?;
+    if header.len() < 14 {
+        return None;
+    }
+    let mut decoded = [0u8; 14];
+    for idx in 0..14 {
+        decoded[idx] = header[idx] ^ key;
+    }
+    let bmp_size = u32::from_le_bytes([decoded[2], decoded[3], decoded[4], decoded[5]]);
+    let bmp_offset = u32::from_le_bytes([decoded[10], decoded[11], decoded[12], decoded[13]]);
+    let file_size = file_bytes.len() as u32;
+    (file_size.abs_diff(bmp_size) < 1024 && (14..=1078).contains(&bmp_offset)).then_some(key)
+}
+
+fn image_key_for_account(account_dir: &Path, attach_root: &Path) -> Result<ImageKeyMaterial> {
+    static IMAGE_KEY_CACHE: OnceLock<Mutex<HashMap<String, ImageKeyMaterial>>> = OnceLock::new();
+
+    let cache_key = account_dir.to_string_lossy().into_owned();
+    let cache = IMAGE_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache.lock().unwrap().get(&cache_key).copied() {
+        return Ok(found);
+    }
+
+    let key = derive_image_key_for_account(account_dir, attach_root)?;
+    cache.lock().unwrap().insert(cache_key, key);
+    Ok(key)
+}
+
+fn derive_image_key_for_account(
+    account_dir: &Path,
+    attach_root: &Path,
+) -> Result<ImageKeyMaterial> {
+    let templates = find_v2_template_ciphertexts(attach_root, 3, 64)?;
+    if templates.is_empty() {
+        bail!("找不到 V2 图片模板，无法派生本地图片 key");
+    }
+
+    let (wxid_raw, wxid_normalized, suffix) = account_wxid_parts(account_dir)
+        .ok_or_else(|| anyhow!("账号目录缺少 wxid 4 位后缀，无法派生本地图片 key"))?;
+    let xor_key = derive_xor_key_from_v2_dat(attach_root, 10, 1)?
+        .ok_or_else(|| anyhow!("V2 图片样本不足，无法派生 XOR key"))?;
+
+    for wxid in preferred_wxid_candidates(&wxid_raw, &wxid_normalized) {
+        if let Some(aes_key) = bruteforce_image_aes_key(xor_key, &suffix, wxid, &templates)? {
+            return Ok(ImageKeyMaterial { aes_key, xor_key });
+        }
+    }
+
+    bail!("派生本地图片 key 失败");
+}
+
+fn account_wxid_parts(account_dir: &Path) -> Option<(String, String, String)> {
+    let raw = account_dir.file_name()?.to_string_lossy().into_owned();
+    let idx = raw.rfind('_')?;
+    let suffix = &raw[idx + 1..];
+    if suffix.len() != 4 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        raw.clone(),
+        normalize_wxid(&raw),
+        suffix.to_ascii_lowercase(),
+    ))
+}
+
+fn normalize_wxid(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(stripped) = raw.strip_prefix("wxid_") {
+        let head = stripped.split('_').next().unwrap_or(stripped);
+        return format!("wxid_{head}");
+    }
+    if let Some((base, suffix)) = raw.rsplit_once('_') {
+        if suffix.len() == 4 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return base.to_string();
+        }
+    }
+    raw.to_string()
+}
+
+fn preferred_wxid_candidates<'a>(raw: &'a str, normalized: &'a str) -> Vec<&'a str> {
+    if raw == normalized {
+        vec![raw]
+    } else {
+        vec![normalized, raw]
+    }
+}
+
+fn find_v2_template_ciphertexts(
+    attach_root: &Path,
+    max_templates: usize,
+    max_files: usize,
+) -> Result<Vec<[u8; 16]>> {
+    let mut out =
+        collect_v2_templates_with_suffix(attach_root, "_t.dat", max_templates, max_files)?;
+    if out.is_empty() {
+        out = collect_v2_templates_with_suffix(attach_root, ".dat", max_templates, max_files)?;
+    }
+    Ok(out)
+}
+
+fn collect_v2_templates_with_suffix(
+    attach_root: &Path,
+    suffix: &str,
+    max_templates: usize,
+    max_files: usize,
+) -> Result<Vec<[u8; 16]>> {
+    if !attach_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut examined = 0usize;
+    visit_files_sorted(attach_root, &mut |path| {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            return Ok(false);
+        };
+        if !name.ends_with(suffix) {
+            return Ok(false);
+        }
+        examined += 1;
+        let bytes = fs::read(path)?;
+        if bytes.len() >= V2_IMAGE_HEADER_SIZE + 16 && bytes.starts_with(&V2_IMAGE_MAGIC) {
+            let mut block = [0u8; 16];
+            block.copy_from_slice(&bytes[V2_IMAGE_HEADER_SIZE..V2_IMAGE_HEADER_SIZE + 16]);
+            if seen.insert(block) {
+                out.push(block);
+            }
+        }
+        Ok(out.len() >= max_templates || examined >= max_files)
+    })?;
+    Ok(out)
+}
+
+fn derive_xor_key_from_v2_dat(
+    attach_root: &Path,
+    sample: usize,
+    min_samples: usize,
+) -> Result<Option<u8>> {
+    if !attach_root.is_dir() {
+        return Ok(None);
+    }
+    let mut votes = Vec::new();
+    visit_files_sorted(attach_root, &mut |path| {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            return Ok(false);
+        };
+        if !name.ends_with(".dat") {
+            return Ok(false);
+        }
+        let bytes = fs::read(path)?;
+        if bytes.len() >= V2_IMAGE_HEADER_SIZE + 16 && bytes.starts_with(&V2_IMAGE_MAGIC) {
+            if let Some(last) = bytes.last() {
+                votes.push(last ^ 0xD9);
+            }
+        }
+        Ok(votes.len() >= sample)
+    })?;
+
+    if votes.len() < min_samples {
+        return Ok(None);
+    }
+    let mut counts = [0usize; 256];
+    for vote in votes {
+        counts[vote as usize] += 1;
+    }
+    Ok(counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .map(|(idx, _)| idx as u8))
+}
+
+fn bruteforce_image_aes_key(
+    xor_key: u8,
+    suffix_hex: &str,
+    wxid: &str,
+    templates: &[[u8; 16]],
+) -> Result<Option<[u8; 16]>> {
+    let suffix = hex_prefix_to_bytes(suffix_hex)?;
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 64);
+    let total = 1u32 << 24;
+    let chunk = total / workers as u32;
+    let stop = Arc::new(AtomicBool::new(false));
+    let wxid = Arc::new(wxid.as_bytes().to_vec());
+    let templates = Arc::new(templates.to_vec());
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for idx in 0..workers {
+            let start = idx as u32 * chunk;
+            let end = if idx + 1 == workers {
+                total
+            } else {
+                (idx as u32 + 1) * chunk
+            };
+            let stop = Arc::clone(&stop);
+            let wxid = Arc::clone(&wxid);
+            let templates = Arc::clone(&templates);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                for upper in start..end {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let uin = (upper << 8) | xor_key as u32;
+                    let uin_ascii = uin.to_string();
+                    let digest = md5::compute(uin_ascii.as_bytes());
+                    if digest.0[0] != suffix[0] || digest.0[1] != suffix[1] {
+                        continue;
+                    }
+
+                    let mut input = Vec::with_capacity(uin_ascii.len() + wxid.len());
+                    input.extend_from_slice(uin_ascii.as_bytes());
+                    input.extend_from_slice(&wxid);
+                    let aes_hex = format!("{:x}", md5::compute(input));
+                    let mut aes_key = [0u8; 16];
+                    aes_key.copy_from_slice(&aes_hex.as_bytes()[..16]);
+                    if verify_image_aes_key(&aes_key, &templates) {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = tx.send(aes_key);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(tx);
+    Ok(rx.try_iter().next())
+}
+
+fn hex_prefix_to_bytes(hex: &str) -> Result<[u8; 2]> {
+    if hex.len() != 4 {
+        bail!("wxid suffix 不是 4 位 hex");
+    }
+    Ok([
+        u8::from_str_radix(&hex[..2], 16)?,
+        u8::from_str_radix(&hex[2..], 16)?,
+    ])
+}
+
+fn verify_image_aes_key(aes_key: &[u8; 16], templates: &[[u8; 16]]) -> bool {
+    !templates.is_empty()
+        && templates
+            .iter()
+            .all(|template| decrypt_template_block(aes_key, template).is_some())
+}
+
+fn decrypt_template_block(aes_key: &[u8; 16], template: &[u8; 16]) -> Option<[u8; 16]> {
+    let aes = Aes128::new(aes_key.into());
+    let mut block = GenericArray::clone_from_slice(template);
+    aes.decrypt_block(&mut block);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&block);
+    (detect_media_content_type(&out) != "application/octet-stream").then_some(out)
+}
+
+fn visit_files_sorted<F>(dir: &Path, visit: &mut F) -> Result<bool>
+where
+    F: FnMut(&Path) -> Result<bool>,
+{
+    let mut entries: Vec<_> = fs::read_dir(dir)?.flatten().collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            if visit_files_sorted(&path, visit)? {
+                return Ok(true);
+            }
+        } else if visit(&path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn find_decodable_image_by_name(root: &Path, filename: &str) -> Result<Option<MediaFile>> {
@@ -1103,16 +1712,41 @@ fn find_file_by_name(root: &Path, filename: &str) -> Result<Option<PathBuf>> {
 }
 
 fn detect_media_content_type(data: &[u8]) -> String {
+    if data.starts_with(b"wxgf") {
+        return "image/heic".to_string();
+    }
     if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return "image/jpeg".to_string();
     }
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         return "image/png".to_string();
     }
+    if data.starts_with(b"GIF8") {
+        return "image/gif".to_string();
+    }
     if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
         return "image/webp".to_string();
     }
+    if data.starts_with(b"BM") {
+        return "image/bmp".to_string();
+    }
+    if data.starts_with(&[0x49, 0x49, 0x2A, 0x00]) {
+        return "image/tiff".to_string();
+    }
     "application/octet-stream".to_string()
+}
+
+fn extension_for_content_type(content_type: &str) -> &'static str {
+    match content_type {
+        "image/heic" => "heic",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tif",
+        _ => "bin",
+    }
 }
 
 fn xml_attr(xml: &str, name: &str) -> Option<String> {
@@ -1722,6 +2356,60 @@ mod tests {
         );
         assert_eq!(recipient_display_name("wxid_1", "", "", "alias"), "alias");
         assert_eq!(recipient_display_name("wxid_1", "", "", ""), "wxid_1");
+    }
+
+    #[test]
+    fn extracts_resource_md5_from_packed_info() {
+        let mut blob = vec![0xAA, 0xBB];
+        blob.extend_from_slice(&[0x12, 0x22, 0x0A, 0x20]);
+        blob.extend_from_slice(b"DEADBEEFCAFEBABE1234567890ABCDEF");
+
+        assert_eq!(
+            extract_resource_md5_from_packed_info(&blob),
+            Some("deadbeefcafebabe1234567890abcdef".to_string())
+        );
+    }
+
+    #[test]
+    fn detects_extended_image_content_types() {
+        assert_eq!(
+            detect_media_content_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            "image/jpeg"
+        );
+        assert_eq!(detect_media_content_type(b"GIF89a"), "image/gif");
+        assert_eq!(detect_media_content_type(b"wxgfxxxx"), "image/heic");
+    }
+
+    #[test]
+    fn decodes_v2_image_segments() {
+        use aes::cipher::BlockEncrypt;
+
+        let key: [u8; 16] = *b"0123456789abcdef";
+        let cipher = Aes128::new((&key).into());
+        let mut plain = b"\xFF\xD8\xFF\xE0".to_vec();
+        plain.extend_from_slice(&[12u8; 12]);
+        let mut block = GenericArray::clone_from_slice(&plain);
+        cipher.encrypt_block(&mut block);
+
+        let xor_key = 0xEF;
+        let mut dat = V2_IMAGE_MAGIC.to_vec();
+        dat.extend_from_slice(&4u32.to_le_bytes());
+        dat.extend_from_slice(&3u32.to_le_bytes());
+        dat.push(0);
+        dat.extend_from_slice(&block);
+        dat.extend_from_slice(b"raw");
+        dat.extend([b'a' ^ xor_key, b'b' ^ xor_key, b'c' ^ xor_key]);
+
+        assert_eq!(
+            decode_v2_image(&dat, &key, xor_key).unwrap(),
+            b"\xFF\xD8\xFF\xE0rawabc"
+        );
+    }
+
+    #[test]
+    fn normalizes_wxid_with_suffix() {
+        assert_eq!(normalize_wxid("wxid_abc_def0"), "wxid_abc");
+        assert_eq!(normalize_wxid("plain_abcd"), "plain");
     }
 
     #[test]
